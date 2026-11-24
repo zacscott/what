@@ -1,0 +1,10 @@
+## Code search
+
+`what` is an index of this git repository: every symbol, every line of text, and every file that history deleted. It always matches the working tree, uncommitted edits included. Use it before grep, glob or reading a whole file.
+
+- `what <name>`: where a class, function, method or file is defined. `Banana.bend` picks a method of a class. Options: `--kind class`, `--path src/`.
+- `what <file>`: what a file defines, with line ranges. `what src/a.py:45-80` prints those lines.
+- `what show <symbol>`: the source of one symbol and not the whole file.
+- `what grep <text>`: text in file contents, each hit under the function or class it sits in. Options: `--regex`, `--path`, `--deleted`, `--commits`.
+
+Files that git history deleted are found too. They are named `COMMIT^:path`, git's name for the file in the commit before the one that deleted it.
