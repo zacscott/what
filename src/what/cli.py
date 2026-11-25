@@ -75,7 +75,7 @@ class _LookupWhenNoCommand(click.Group):
     "--index", "build_index", is_flag=True, help="build or update the whole index now, deleted files included"
 )
 @click.option("--prompt", is_flag=True, help="print the instructions that tell a coding harness to use this command")
-def app(build_index: bool, prompt: bool) -> None:
+def app(*, build_index: bool, prompt: bool) -> None:
     if prompt:
         # prompt.md goes in a harness's instructions file, such as AGENTS.md.
         print((Path(__file__).with_name("config") / "prompt.md").read_text(), end="")
@@ -84,7 +84,7 @@ def app(build_index: bool, prompt: bool) -> None:
         index.refresh()
         index.refresh_history()
         index.refresh_branches()
-        dependencies.package_rows(index, dependencies.installed(index, False).packages)
+        dependencies.package_rows(index, dependencies.installed(index, transitive=False).packages)
 
 
 def main() -> None:
@@ -109,6 +109,7 @@ def main() -> None:
 @click.option("--all-deps", is_flag=True, help=ALL_DEPS_HELP)
 def lookup(
     query: tuple[str, ...],
+    *,
     kind: str | None,
     path: str | None,
     limit: int,
@@ -118,8 +119,19 @@ def lookup(
     all_deps: bool,
 ) -> None:
     """Find a name, list what a file defines or print a line range. what runs this when no command is given."""
-    reach = _reach(deps, all_deps)
-    print(search.lookup(_searchable_index(), " ".join(query), _kind(kind), path, limit, ref, branches, reach))
+    reach = _reach(deps=deps, all_deps=all_deps)
+    print(
+        search.lookup(
+            _searchable_index(),
+            " ".join(query),
+            kind=_kind(kind),
+            path=path,
+            limit=limit,
+            ref=ref,
+            branches=branches,
+            deps=reach,
+        )
+    )
 
 
 @app.command()
@@ -133,6 +145,7 @@ def lookup(
 @click.option("--all-deps", is_flag=True, help=ALL_DEPS_HELP)
 def find(
     query: tuple[str, ...],
+    *,
     kind: str | None,
     path: str | None,
     limit: int,
@@ -142,8 +155,19 @@ def find(
     all_deps: bool,
 ) -> None:
     """Find where a class, function, method, type or file is defined, by name or part of one."""
-    reach = _reach(deps, all_deps)
-    print(search.find(_searchable_index(), " ".join(query), _kind(kind), path, limit, ref, branches, reach))
+    reach = _reach(deps=deps, all_deps=all_deps)
+    print(
+        search.find(
+            _searchable_index(),
+            " ".join(query),
+            kind=_kind(kind),
+            path=path,
+            limit=limit,
+            ref=ref,
+            branches=branches,
+            deps=reach,
+        )
+    )
 
 
 @app.command()
@@ -158,6 +182,7 @@ def find(
 @click.option("--limit", default=40, show_default=True)
 def grep(
     pattern: tuple[str, ...],
+    *,
     regex: bool,
     path: str | None,
     deleted: bool,
@@ -169,17 +194,29 @@ def grep(
 ) -> None:
     """Search file contents. Each hit is listed under the symbol it sits in. Case is ignored unless the pattern has a capital."""
     index = _searchable_index()
-    reach = _reach(deps, all_deps)
-    print(search.grep(index, " ".join(pattern), regex, path, limit, deleted, commits, branches, reach))
+    reach = _reach(deps=deps, all_deps=all_deps)
+    print(
+        search.grep(
+            index,
+            " ".join(pattern),
+            regex=regex,
+            path=path,
+            limit=limit,
+            deleted=deleted,
+            commits=commits,
+            branches=branches,
+            deps=reach,
+        )
+    )
 
 
 @app.command()
 @click.argument("target")
 @click.option("--path", help=PATH_HELP)
 @click.option("--limit", default=40, show_default=True)
-def callers(target: str, path: str | None, limit: int) -> None:
+def callers(target: str, *, path: str | None, limit: int) -> None:
     """List the lines that call or reference a symbol ("Banana.bend"), each under the function it sits in."""
-    print(search.callers(_searchable_index(), target, path, limit))
+    print(search.callers(_searchable_index(), target, path=path, limit=limit))
 
 
 @app.command()
@@ -187,7 +224,7 @@ def callers(target: str, path: str | None, limit: int) -> None:
 @click.option("--ref", help=REF_HELP)
 def outline(path: str, ref: str | None) -> None:
     """List every symbol in one file with its line range. PATH can be the end of a path, and deleted files work too."""
-    print(search.outline(_searchable_index(), path, ref))
+    print(search.outline(_searchable_index(), path, ref=ref))
 
 
 @app.command()
@@ -198,13 +235,14 @@ def outline(path: str, ref: str | None) -> None:
 @click.option("--all-deps", is_flag=True, help=ALL_DEPS_HELP)
 def show(
     target: str,
+    *,
     path: str | None,
     ref: str | None,
     deps: bool,
     all_deps: bool,
 ) -> None:
     """Print the source of one symbol ("Banana.bend"), a line range ("src/a.py:45-80") or a file."""
-    print(search.show(_searchable_index(), target, path, ref, _reach(deps, all_deps)))
+    print(search.show(_searchable_index(), target, path=path, ref=ref, deps=_reach(deps=deps, all_deps=all_deps)))
 
 
 def _kind(value: str | None) -> Kind | None:
@@ -212,7 +250,7 @@ def _kind(value: str | None) -> Kind | None:
     return Kind(value.lower()) if value else None
 
 
-def _reach(deps: bool, all_deps: bool) -> DependencyReach:
+def _reach(*, deps: bool, all_deps: bool) -> DependencyReach:
     """When a search reads the installed dependencies, from the --deps and --all-deps options."""
     if all_deps:
         return DependencyReach.ALL

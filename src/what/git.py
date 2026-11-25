@@ -135,6 +135,7 @@ def files_at(root: Path, commit: str) -> dict[str, str]:
 def paths_containing(
     root: Path,
     commit: str,
+    *,
     text: str,
 ) -> list[str]:
     """The text files at a commit tjat contain text, ignoring case."""
@@ -194,6 +195,7 @@ def default_branch(root: Path) -> str | None:
 
 def merge_base(
     root: Path,
+    *,
     first: str,
     second: str,
 ) -> str | None:
@@ -203,6 +205,7 @@ def merge_base(
 
 def changed_files(
     root: Path,
+    *,
     base: str,
     tip: str,
 ) -> dict[str, str]:
@@ -228,7 +231,7 @@ def last_fetch(root: Path) -> float | None:
         return None
 
 
-def is_ancestor(root: Path, older: str, newer: str) -> bool:
+def is_ancestor(root: Path, *, older: str, newer: str) -> bool:
     """True when the commit newer has the commit older somewhere in its history."""
     command = ["git", "-C", str(root), "merge-base", "--is-ancestor", older, newer]
     return subprocess.run(command, capture_output=True, check=False).returncode == 0
@@ -319,7 +322,7 @@ def _blobs_in(oids: list[str], output: bytes) -> Iterator[tuple[str, bytes | Non
         position += size + 1
 
 
-def commits_changing_text(root: Path, text: str, limit: int, timeout: float) -> list[str] | None:
+def commits_changing_text(root: Path, text: str, *, limit: int, timeout: float) -> list[str] | None:
     """
     One line per commit that added or removed text, newest first. This reads
     every commit's diff, so it returns None when it runs past the timeout.

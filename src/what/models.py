@@ -218,6 +218,21 @@ class Place:
 
 
 @dataclass(frozen=True, slots=True)
+class NameQuery:
+    """
+    A search for symbols by name. name is the name, without its class. words are the parts of the query, which a
+    name must each contain to match loosely. parent, kind and path narrow the search when they are set. For example
+    "Banana.bend" gives NameQuery("bend", ("Banana.bend",), "Banana", None, None).
+    """
+
+    name: str
+    words: tuple[str, ...]
+    parent: str | None
+    kind: Kind | None
+    path: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class SymbolHit:
     """
     One symbol a search found, and the file it is in. The searches take the same
@@ -266,6 +281,7 @@ class _Session:
     def __init__(
         self,
         db: sqlite3.Connection,
+        *,
         schema: str,
         version: int,
     ) -> None:
@@ -310,24 +326,24 @@ class IndexSession(_Session):
     """One open connection to the index of one repository, with the queries that read and write it."""
 
     def __init__(self, db: sqlite3.Connection) -> None:
-        super().__init__(db, SCHEMA, SCHEMA_VERSION)
+        super().__init__(db, schema=SCHEMA, version=SCHEMA_VERSION)
 
     def places_at_path(self, path: str) -> list[Place]:
         """The file at exactly this path, as a list of one, or empty when there is none."""
-        return self._places_where("path = ?", [path], Scope.WORKING_TREE)
+        return self._places_where("path = ?", [path], scope=Scope.WORKING_TREE)
 
     def places_ending_with(self, path: str) -> list[Place]:
         """Every file whose path ends with this one after a slash, so "a.py" matches "src/a.py"."""
-        return self._places_where("path LIKE ? ESCAPE '\\'", ["%/" + _like_escape(path)], Scope.WORKING_TREE)
+        return self._places_where("path LIKE ? ESCAPE '\\'", ["%/" + _like_escape(path)], scope=Scope.WORKING_TREE)
 
     def places_containing_all(self, words: list[str], scope: Scope = Scope.WORKING_TREE) -> list[Place]:
         """Files whose path contains every word."""
         condition = " AND ".join("path LIKE ? ESCAPE '\\'" for _ in words)
-        return self._places_where(condition, ["%" + _like_escape(word) + "%" for word in words], scope)
+        return self._places_where(condition, ["%" + _like_escape(word) + "%" for word in words], scope=scope)
 
     def places_containing_in_order(self, parts: list[str]) -> list[Place]:
         """Files whose payh contains every part, in order, with anything between."""
-        return self._places_where("path LIKE ? ESCAPE '\\'", [_in_order(parts)], Scope.WORKING_TREE)
+        return self._places_where("path LIKE ? ESCAPE '\\'", [_in_order(parts)], scope=Scope.WORKING_TREE)
 
     def live_places_with_text(self, literals: list[str]) -> list[Place]:
         """
@@ -361,17 +377,19 @@ class IndexSession(_Session):
     def symbols_named(
         self,
         name: str,
+        *,
         parent: str | None,
         kind: Kind | None,
         path: str | None,
         scope: Scope = Scope.WORKING_TREE,
     ) -> list[SymbolHit]:
         """Symbols with exactly this name, ignoring case."""
-        return self._matching_symbols("s.name = ?", [name], parent, kind, path, scope)
+        return self._matching_symbols("s.name = ?", [name], parent=parent, kind=kind, path_filter=path, scope=scope)
 
     def symbols_starting_with(
         self,
         prefix: str,
+        *,
         parent: str | None,
         kind: Kind | None,
         path: str | None,
@@ -379,12 +397,18 @@ class IndexSession(_Session):
     ) -> list[SymbolHit]:
         """Symbols whose name starts with this text."""
         return self._matching_symbols(
-            "s.name LIKE ? ESCAPE '\\'", [_like_escape(prefix) + "%"], parent, kind, path, scope
+            "s.name LIKE ? ESCAPE '\\'",
+            [_like_escape(prefix) + "%"],
+            parent=parent,
+            kind=kind,
+            path_filter=path,
+            scope=scope,
         )
 
     def symbols_containing_all(
         self,
         words: list[str],
+        *,
         parent: str | None,
         kind: Kind | None,
         path: str | None,
@@ -402,18 +426,26 @@ class IndexSession(_Session):
             conditions.append("s.rowid IN (SELECT rowid FROM symbol_names WHERE name LIKE ?)")
             parameters.append("%" + longest.replace("%", "") + "%")
 
-        return self._matching_symbols(" AND ".join(conditions), parameters, parent, kind, path, scope)
+        return self._matching_symbols(
+            " AND ".join(conditions), parameters, parent=parent, kind=kind, path_filter=path, scope=scope
+        )
 
     def symbols_containing_in_order(
         self,
         parts: list[str],
+        *,
         parent: str | None,
         kind: Kind | None,
         path: str | None,
     ) -> list[SymbolHit]:
         """Symbols whose name contains every part, in order, with anything between."""
         return self._matching_symbols(
-            "s.name LIKE ? ESCAPE '\\'", [_in_order(parts)], parent, kind, path, Scope.WORKING_TREE
+            "s.name LIKE ? ESCAPE '\\'",
+            [_in_order(parts)],
+            parent=parent,
+            kind=kind,
+            path_filter=path,
+            scope=Scope.WORKING_TREE,
         )
 
     def symbols_in_blob(self, blob: int) -> list[SymbolHit]:
@@ -438,6 +470,7 @@ class IndexSession(_Session):
         self,
         oid: str,
         parsed_as: str,
+        *,
         text: str | None,
         symbols: list[Symbol],
         index_text: bool = True,
@@ -505,7 +538,7 @@ class IndexSession(_Session):
         rows = self._db.execute("SELECT f.path, b.oid, f.stat FROM files f JOIN blobs b ON b.id = f.blob")
         return {path: KnownFile(oid, stat) for path, oid, stat in rows}
 
-    def save_file(self, path: str, blob: int, stat: str | None) -> None:
+    def save_file(self, path: str, *, blob: int, stat: str | None) -> None:
         """Record the content a path holds, replacing what it held before."""
         self._db.execute("INSERT OR REPLACE INTO files (path, blob, stat) VALUES (?, ?, ?)", (path, blob, stat))
 
@@ -513,7 +546,7 @@ class IndexSession(_Session):
         """Forget these paths. Their blobs stay until delete_unused_blobs runs."""
         self._db.executemany("DELETE FROM files WHERE path = ?", [(path,) for path in paths])
 
-    def save_deleted_file(self, path: str, blob: int, commit: str, date: str) -> None:
+    def save_deleted_file(self, path: str, *, blob: int, commit: str, date: str) -> None:
         """Record the content a deleted path held and the commit that deleted it, replacing ayn earlier record."""
         self._db.execute(
             "INSERT OR REPLACE INTO deleted (path, blob, commit_id, date) VALUES (?, ?, ?, ?)",
@@ -539,6 +572,7 @@ class IndexSession(_Session):
     def save_branch(
         self,
         name: str,
+        *,
         tip: str,
         head: str,
         date: int,
@@ -566,6 +600,7 @@ class IndexSession(_Session):
         self,
         condition: str,
         parameters: list[str],
+        *,
         scope: Scope,
     ) -> list[Place]:
         """
@@ -612,6 +647,7 @@ class IndexSession(_Session):
         self,
         condition: str,
         parameters: list[str],
+        *,
         parent: str | None,
         kind: Kind | None,
         path_filter: str | None,
@@ -698,9 +734,9 @@ class DependencySession(_Session):
     """One open connection to the index of installed dependencies, which every repository shares."""
 
     def __init__(self, db: sqlite3.Connection) -> None:
-        super().__init__(db, DEPENDENCY_SCHEMA, DEPENDENCY_SCHEMA_VERSION)
+        super().__init__(db, schema=DEPENDENCY_SCHEMA, version=DEPENDENCY_SCHEMA_VERSION)
 
-    def package_row(self, ecosystem: str, name: str, version: str) -> int | None:
+    def package_row(self, ecosystem: str, name: str, *, version: str) -> int | None:
         """The row id of one version of a package, or None when it isn't indexed yet."""
         row = self._db.execute(
             "SELECT id FROM packages WHERE ecosystem = ? AND name = ? AND version = ?", (ecosystem, name, version)
@@ -711,6 +747,7 @@ class DependencySession(_Session):
         self,
         ecosystem: str,
         name: str,
+        *,
         version: str,
         files: dict[str, list[Symbol]],
     ) -> int:
@@ -741,26 +778,31 @@ class DependencySession(_Session):
     def symbols_named(
         self,
         name: str,
+        *,
         parent: str | None,
         kind: Kind | None,
         packages: list[int],
     ) -> list[PackageSymbol]:
         """Symbols with exactly this name, ignoring case."""
-        return self._matching_symbols("name = ?", [name], parent, kind, packages)
+        return self._matching_symbols("name = ?", [name], parent=parent, kind=kind, packages=packages)
 
     def symbols_starting_with(
         self,
         prefix: str,
+        *,
         parent: str | None,
         kind: Kind | None,
         packages: list[int],
     ) -> list[PackageSymbol]:
         """Symbols whose name starts with this text."""
-        return self._matching_symbols("name LIKE ? ESCAPE '\\'", [_like_escape(prefix) + "%"], parent, kind, packages)
+        return self._matching_symbols(
+            "name LIKE ? ESCAPE '\\'", [_like_escape(prefix) + "%"], parent=parent, kind=kind, packages=packages
+        )
 
     def symbols_containing_all(
         self,
         words: list[str],
+        *,
         parent: str | None,
         kind: Kind | None,
         packages: list[int],
@@ -768,13 +810,14 @@ class DependencySession(_Session):
         """Symbols whose name contains every word."""
         condition = " AND ".join("name LIKE ? ESCAPE '\\'" for _ in words)
         return self._matching_symbols(
-            condition, ["%" + _like_escape(word) + "%" for word in words], parent, kind, packages
+            condition, ["%" + _like_escape(word) + "%" for word in words], parent=parent, kind=kind, packages=packages
         )
 
     def _matching_symbols(
         self,
         condition: str,
         parameters: list[str],
+        *,
         parent: str | None,
         kind: Kind | None,
         packages: list[int],

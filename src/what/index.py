@@ -129,7 +129,7 @@ class Index:
             if not locked or current is None or current == done:
                 return
 
-            since = done if done and git.is_ancestor(self.root, done, current) else None
+            since = done if done and git.is_ancestor(self.root, older=done, newer=current) else None
             if done and since is None:
                 # HEAD moved to another line of history, so the old list of deletions no longer applies.
                 session.delete_all_deleted_files()
@@ -175,13 +175,17 @@ class Index:
                 return BranchState(branches, len(stale))
 
             def changed_files(branch: git.Branch) -> dict[str, str]:
-                base = current if branch.is_default else git.merge_base(self.root, default or current, branch.tip)
-                return git.changed_files(self.root, base, branch.tip) if base else {}
+                base = (
+                    current
+                    if branch.is_default
+                    else git.merge_base(self.root, first=default or current, second=branch.tip)
+                )
+                return git.changed_files(self.root, base=base, tip=branch.tip) if base else {}
 
             # Each branch needs two git commands, and they spend most of their time waiting on the disk.
             with ThreadPoolExecutor(settings.GIT_THREADS) as threads:
                 for branch, changed in zip(stale, threads.map(changed_files, stale)):
-                    self._index_branch(session, branch, _base_key(branch, current), sorted(changed.items()))
+                    self._index_branch(session, branch, head=_base_key(branch, current), files=sorted(changed.items()))
 
             gone = [name for name in known if name not in {branch.name for branch in branches}]
             if gone:
@@ -268,19 +272,20 @@ class Index:
         with session.write_transaction():
             parsed = _parse_new(session, [(path, oid, text) for path, oid, _, text in read])
             for path, oid, stat, text in read:
-                session.save_file(path, _add_blob(session, oid, path, text, parsed), stat)
+                session.save_file(path, blob=_add_blob(session, oid, path=path, text=text, parsed=parsed), stat=stat)
 
     def _index_deletions(self, session: IndexSession, batch: list[git.Deletion]) -> None:
         # The transaction starts before the check for known blobs, so another process can't delete one in between.
         with session.write_transaction():
             blobs = self._add_git_blobs(session, [(deletion.path, deletion.oid) for deletion in batch])
             for deletion, blob in zip(batch, blobs):
-                session.save_deleted_file(deletion.path, blob, deletion.commit, deletion.date)
+                session.save_deleted_file(deletion.path, blob=blob, commit=deletion.commit, date=deletion.date)
 
     def _index_branch(
         self,
         session: IndexSession,
         branch: git.Branch,
+        *,
         head: str,
         files: list[tuple[str, str]],
     ) -> None:
@@ -300,12 +305,13 @@ class Index:
                 session.save_branch_files(branch.name, [(path, blob) for (path, _), blob in zip(batch, blobs)])
 
         with session.write_transaction():
-            session.save_branch(branch.name, branch.tip, head, branch.date)
+            session.save_branch(branch.name, tip=branch.tip, head=head, date=branch.date)
 
     def _add_git_blobs(
         self,
         session: IndexSession,
         files: list[tuple[str, str]],
+        *,
         index_text: bool = True,
     ) -> list[int]:
         """
@@ -328,7 +334,10 @@ class Index:
         contents = [(path, oid, texts.get(oid) if _has_indexed_text(path) else None) for path, oid in files]
         parsed = _parse_new(session, contents)
 
-        return [_add_blob(session, oid, path, text, parsed, index_text) for path, oid, text in contents]
+        return [
+            _add_blob(session, oid, path=path, text=text, parsed=parsed, index_text=index_text)
+            for path, oid, text in contents
+        ]
 
     def _is_locked(self, name: LockName) -> bool:
         """True when another process holds one of the locks that _lock takes."""
@@ -379,6 +388,7 @@ def _parse_new(
 def _add_blob(
     session: IndexSession,
     oid: str,
+    *,
     path: str,
     text: str | None,
     parsed: dict[tuple[str, str], list[Symbol]],
@@ -396,7 +406,7 @@ def _add_blob(
         return known
 
     symbols = parsed.get((oid, parsed_as), []) if text is not None else []
-    return session.insert_blob(oid, parsed_as, text, symbols, index_text)
+    return session.insert_blob(oid, parsed_as, text=text, symbols=symbols, index_text=index_text)
 
 
 def _parsed_as(path: str) -> str:

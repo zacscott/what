@@ -7,7 +7,7 @@ import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from functools import cache
-from typing import assert_never
+from typing import NamedTuple, assert_never
 
 from what import dependencies, git
 from what.config import settings
@@ -19,6 +19,7 @@ from what.models import (
     IndexSession,
     InPackage,
     Live,
+    NameQuery,
     OnBranch,
     Place,
     Scope,
@@ -68,6 +69,7 @@ RECEIVER = re.compile(r"([\w$\\]*)\s*(::|\?->|->|\?\.|\.|\\)\s*$")
 def lookup(
     index: Index,
     query: str,
+    *,
     kind: Kind | None = None,
     path: str | None = None,
     limit: int = 30,
@@ -80,12 +82,12 @@ def lookup(
     names one file gives the file's outline, or its text when it defines nothing. Anything else is a name for find.
     """
     if ref is not None:
-        return _lookup_at_ref(index, query, kind, path, limit, ref)
+        return _lookup_at_ref(index, query, kind=kind, path=path, limit=limit, ref=ref)
 
     index.refresh()
 
     if LINE_RANGE.fullmatch(query):
-        return _show(index, query, path, deps)
+        return _show(index, query, path=path, deps=deps)
 
     # A plain word is always a name. Scripts like bin/refresh are often named after a function, and the function
     # is what a search for "refresh" wants.
@@ -95,32 +97,34 @@ def lookup(
         defines_something = len(places) == 1 and bool(session.symbols_in_blob(places[0].blob_row))
 
     if len(places) != 1:
-        return _find(index, query, kind, path, limit, branches, deps)
-    return _outline(index, query) if defines_something else _show(index, query, None, deps)
+        return _find(index, query, kind=kind, path=path, limit=limit, branches=branches, deps=deps)
+    return _outline(index, query) if defines_something else _show(index, query, path=None, deps=deps)
 
 
 def _lookup_at_ref(
     index: Index,
     query: str,
+    *,
     kind: Kind | None,
     path: str | None,
     limit: int,
     ref: str,
 ) -> str:
     if LINE_RANGE.fullmatch(query):
-        return _show_at_ref(index, query, path, ref)
+        return _show_at_ref(index, query, path=path, ref=ref)
 
     names_a_file = not kind and ("/" in query or "." in query)
-    places = _resolve_tree_path(_tree_at(index, ref)[1], ref, query) if names_a_file else []
+    places = _resolve_tree_path(_tree_at(index, ref)[1], ref, path=query) if names_a_file else []
 
     if len(places) != 1:
-        return _find_at_ref(index, query, kind, path, limit, ref)
-    return _outline_at_ref(index, query, ref)
+        return _find_at_ref(index, query, kind=kind, path=path, limit=limit, ref=ref)
+    return _outline_at_ref(index, query, ref=ref)
 
 
 def find(
     index: Index,
     query: str,
+    *,
     kind: Kind | None = None,
     path: str | None = None,
     limit: int = 30,
@@ -134,15 +138,16 @@ def find(
     tree has no match. deps says when the installed dependencies are searched.
     """
     if ref is not None:
-        return _find_at_ref(index, query, kind, path, limit, ref)
+        return _find_at_ref(index, query, kind=kind, path=path, limit=limit, ref=ref)
 
     index.refresh()
-    return _find(index, query, kind, path, limit, branches, deps)
+    return _find(index, query, kind=kind, path=path, limit=limit, branches=branches, deps=deps)
 
 
 def _find(
     index: Index,
     query: str,
+    *,
     kind: Kind | None,
     path: str | None,
     limit: int,
@@ -154,26 +159,27 @@ def _find(
         return "Give a symbol name or part of a file path."
 
     parent, name = _split_qualified("".join(words))
+    wanted = NameQuery(name, tuple(words), parent, kind, path)
 
     in_dependencies = _in_dependencies(index)
     with index.connect() as session:
-        hits = _find_symbols(session, name, words, parent, kind, path)
-        paths = [] if kind else _find_paths(session, words, path)
+        hits = _find_symbols(session, wanted)
+        paths = [] if kind else _find_paths(session, words, path_filter=path)
         if not hits and not paths:
-            hits, paths = _find_abbreviated(session, name, parent, kind, path)
+            hits, paths = _find_abbreviated(session, wanted)
 
     hits = [hit for hit in hits if not in_dependencies(hit.place.path)]
     paths = [place for place in paths if not in_dependencies(place.path)]
 
-    here = _found_lines(hits, paths, limit) if hits or paths else []
+    here = _found_lines(hits, paths, limit=limit) if hits or paths else []
     elsewhere: list[str] = []
     notes: list[str] = []
     if branches or not here:
-        elsewhere, notes = _find_on_branches(index, name, words, parent, kind, path, limit, bool(here))
+        elsewhere, notes = _find_on_branches(index, wanted, limit=limit, found_here=bool(here))
 
     if deps != DependencyReach.FALLBACK or not here:
-        package_hits, package_notes = _dependency_symbols(index, name, words, parent, kind, deps)
-        elsewhere += _found_lines(_ranked(package_hits), [], limit)
+        package_hits, package_notes = _dependency_symbols(index, wanted, deps=deps)
+        elsewhere += _found_lines(_ranked(package_hits), [], limit=limit)
         notes += package_notes
 
     if here or elsewhere:
@@ -183,61 +189,78 @@ def _find(
         return "\n".join([f"No {kind} named {query!r}. Run find without kind to see other matches.", *notes])
 
     # A grammar can miss a definition, so the text of the files is searched before saying "nothing".
-    text_matches = _text_search(index, query, False, path, limit, False).lines
+    text_matches = _text_search(index, query, regex=False, path=path, limit=limit, deleted=False).lines
     if not text_matches:
         nothing = f"Nothing named or containing {query!r} in live or deleted files, other branches or dependencies."
         return "\n".join([nothing, *notes])
     return "\n".join([f"No symbol or path named {query!r}. Text matches:", *text_matches, *notes])
 
 
+class PackageHits(NamedTuple):
+    """Symbols in the installed dependencies, in the tiers find ranks, and a note for each incomplete lockfile."""
+
+    tiers: list[list[SymbolHit]]
+    notes: list[str]
+
+
+class Section(NamedTuple):
+    """The output of a search beyond the working tree, and notes for its last lines, such as what isn't indexed yet."""
+
+    lines: list[str]
+    notes: list[str]
+
+
 def _dependency_symbols(
     index: Index,
-    name: str,
-    words: list[str],
-    parent: str | None,
-    kind: Kind | None,
+    wanted: NameQuery,
+    *,
     deps: DependencyReach,
-) -> tuple[list[list[SymbolHit]], list[str]]:
+) -> PackageHits:
     """
     Symbols in the installed dependencies that match a name, in the tiers find ranks, and a note for each lockfile
     with packages that aren't installed.
     """
-    installed = dependencies.installed(index, deps == DependencyReach.ALL)
+    installed = dependencies.installed(index, transitive=deps == DependencyReach.ALL)
     packages = dependencies.package_rows(index, installed.packages)
     if not packages:
-        return [], list(installed.notes)
+        return PackageHits([], list(installed.notes))
 
-    return dependencies.find_symbols(index, packages, name, words, parent, kind), list(installed.notes)
+    return PackageHits(dependencies.find_symbols(index, packages, query=wanted), list(installed.notes))
 
 
 def _find_on_branches(
     index: Index,
-    name: str,
-    words: list[str],
-    parent: str | None,
-    kind: Kind | None,
-    path: str | None,
+    wanted: NameQuery,
+    *,
     limit: int,
     found_here: bool,
-) -> tuple[list[str], list[str]]:
+) -> Section:
     """
     The output of find on other branches, empty when no branch has a match that the working tree lacks, and a note
     when some branches aren't indexed yet.
     """
     branches, notes = _read_branches(index)
     if not branches:
-        return [], notes
+        return Section([], notes)
 
     with index.connect() as session:
-        hits = _find_symbols(session, name, words, parent, kind, path, Scope.BRANCHES)
-        paths = [] if kind else _find_paths(session, words, path, Scope.BRANCHES)
+        hits = _find_symbols(session, wanted, scope=Scope.BRANCHES)
+        paths = (
+            []
+            if wanted.kind
+            else _find_paths(session, list(wanted.words), path_filter=wanted.path, scope=Scope.BRANCHES)
+        )
 
     if not hits and not paths:
-        return [], notes
+        return Section([], notes)
 
     places = [hit.place for hit in hits[:limit]] + paths
-    found = [_branches_heading(places, found_here), *_found_lines(hits, paths, limit), *_fetch_note(index, branches)]
-    return found, notes
+    found = [
+        _branches_heading(places, found_here=found_here),
+        *_found_lines(hits, paths, limit=limit),
+        *_fetch_note(index, branches),
+    ]
+    return Section(found, notes)
 
 
 def _read_branches(index: Index) -> tuple[list[git.Branch], list[str]]:
@@ -253,7 +276,7 @@ def _read_branches(index: Index) -> tuple[list[git.Branch], list[str]]:
     return branches, [BRANCHES_BUILDING.format(count=pending)]
 
 
-def _branches_heading(places: list[Place], found_here: bool) -> str:
+def _branches_heading(places: list[Place], *, found_here: bool) -> str:
     """The line before the matches on other branches, such as "not in this checkout; found on 2 other branches:"."""
     count = len({place.origin.name for place in places if isinstance(place.origin, OnBranch)})
     branches = "1 other branch" if count == 1 else f"{count} other branches"
@@ -277,6 +300,7 @@ def _fetch_note(index: Index, branches: list[git.Branch]) -> list[str]:
 def _found_lines(
     hits: list[SymbolHit],
     paths: list[Place],
+    *,
     limit: int,
 ) -> list[str]:
     """The output of find: symbol hits grouped by file, then the files whose path matched."""
@@ -301,6 +325,7 @@ def _found_lines(
 def _find_at_ref(
     index: Index,
     query: str,
+    *,
     kind: Kind | None,
     path: str | None,
     limit: int,
@@ -317,8 +342,8 @@ def _find_at_ref(
 
     symbols = [
         hit
-        for hit in _symbols_at(index, commit, tree, ref, max(words, key=len), path)
-        if _parent_and_kind_match(hit, parent, kind)
+        for hit in _symbols_at(index, commit, tree=tree, ref=ref, text=max(words, key=len), path_filter=path)
+        if _parent_and_kind_match(hit, parent=parent, kind=kind)
     ]
     hits = _ranked(
         [
@@ -327,16 +352,17 @@ def _find_at_ref(
             [hit for hit in symbols if all(word.lower() in hit.name.lower() for word in words)],
         ]
     )
-    paths = [] if kind else _paths_at(tree, ref, words, path)
+    paths = [] if kind else _paths_at(tree, ref, words=words, path_filter=path)
 
     if not hits and not paths:
         return f"Nothing named or containing {query!r} at {ref}."
-    return "\n".join(_found_lines(hits, paths, limit))
+    return "\n".join(_found_lines(hits, paths, limit=limit))
 
 
 def grep(
     index: Index,
     pattern: str,
+    *,
     regex: bool = False,
     path: str | None = None,
     limit: int = 40,
@@ -354,24 +380,32 @@ def grep(
     index.refresh()
 
     try:
-        found = _text_search(index, pattern, regex, path, limit, deleted)
+        found = _text_search(index, pattern, regex=regex, path=path, limit=limit, deleted=deleted)
     except re.error as error:
         return f"Invalid regex: {error}"
 
     notes: list[str] = []
     if deps != DependencyReach.FALLBACK:
-        installed = dependencies.installed(index, deps == DependencyReach.ALL)
+        installed = dependencies.installed(index, transitive=deps == DependencyReach.ALL)
         packages = dependencies.package_rows(index, installed.packages)
         places = [place for place in dependencies.source_places(index, packages) if path_matches(place.path, path)]
         with index.connect() as session:
             found.add(
-                _matching_lines(session, _file_texts(index, places), _matcher(pattern, regex)[0], limit, len(places))
+                _matching_lines(
+                    session,
+                    _file_texts(index, places),
+                    matcher=_matcher(pattern, regex=regex)[0],
+                    limit=limit,
+                    candidates=len(places),
+                )
             )
         notes = list(installed.notes)
 
     output = [found.summary(), *found.lines] if found.lines else []
     if branches or not found.lines:
-        on_branches, branch_notes = _grep_on_branches(index, pattern, regex, path, limit, bool(found.lines))
+        on_branches, branch_notes = _grep_on_branches(
+            index, pattern, regex=regex, path=path, limit=limit, found_here=bool(found.lines)
+        )
         output.extend(on_branches)
         notes.extend(branch_notes)
     if commits:
@@ -387,6 +421,7 @@ def grep(
 def _grep_on_branches(
     index: Index,
     pattern: str,
+    *,
     regex: bool,
     path: str | None,
     limit: int,
@@ -400,14 +435,20 @@ def _grep_on_branches(
     if not branches:
         return [], notes
 
-    matcher, literals = _matcher(pattern, regex)
+    matcher, literals = _matcher(pattern, regex=regex)
     with index.connect() as session:
         places = _small_enough(index, [place for place in session.branch_places() if path_matches(place.path, path)])
-        found = _matching_lines(session, _branch_texts(index, places, literals), matcher, limit, len(places))
+        found = _matching_lines(
+            session,
+            _branch_texts(index, places, literals=literals),
+            matcher=matcher,
+            limit=limit,
+            candidates=len(places),
+        )
 
     if not found.lines:
         return [], notes
-    heading = _branches_heading(found.places, found_here)
+    heading = _branches_heading(found.places, found_here=found_here)
     return [heading, found.summary(), *found.lines, *_fetch_note(index, branches)], notes
 
 
@@ -450,13 +491,14 @@ class TextMatches:
 def _text_search(
     index: Index,
     pattern: str,
+    *,
     regex: bool,
     path: str | None,
     limit: int,
     deleted: bool,
 ) -> TextMatches:
     """The lines a text search matched, with no lines when nothing matches."""
-    matcher, literals = _matcher(pattern, regex)
+    matcher, literals = _matcher(pattern, regex=regex)
 
     # Installed dependencies would bury the repository's own code. grep reads them only when asked to.
     in_dependencies = _in_dependencies(index)
@@ -469,7 +511,7 @@ def _text_search(
         ]
         texts = ((place, index.read_live(place.path)) for place in live)
 
-        found = _matching_lines(session, texts, matcher, limit, len(live))
+        found = _matching_lines(session, texts, matcher=matcher, limit=limit, candidates=len(live))
         if found.lines and not deleted:
             return found
 
@@ -479,7 +521,7 @@ def _text_search(
             return found
 
         gone = [place for place in session.deleted_places_with_text(literals) if path_matches(place.path, path)]
-        found.add(_matching_lines(session, _git_texts(index, gone), matcher, limit, len(gone)))
+        found.add(_matching_lines(session, _git_texts(index, gone), matcher=matcher, limit=limit, candidates=len(gone)))
 
     return found
 
@@ -493,7 +535,7 @@ def _in_dependencies(index: Index) -> Callable[[str], bool]:
     return lambda path: path.startswith(folders) or "/node_modules/" in path
 
 
-def _matcher(pattern: str, regex: bool) -> tuple[re.Pattern[str], list[str]]:
+def _matcher(pattern: str, *, regex: bool) -> tuple[re.Pattern[str], list[str]]:
     """The compiled pattern, and the plain text every match must contain, for the trigram index to look up."""
     # The search ignores case unless the pattern has a capital letter in it. An escape like \S is not a capital.
     letters = re.sub(r"\\.", "", pattern) if regex else pattern
@@ -511,6 +553,7 @@ def _file_texts(index: Index, places: list[Place]) -> Iterator[tuple[Place, str 
 def _branch_texts(
     index: Index,
     places: list[Place],
+    *,
     literals: list[str],
 ) -> Iterator[tuple[Place, str | None]]:
     """
@@ -543,6 +586,7 @@ def _git_texts(index: Index, places: list[Place]) -> Iterator[tuple[Place, str |
 def callers(
     index: Index,
     target: str,
+    *,
     path: str | None = None,
     limit: int = 40,
 ) -> str:
@@ -555,7 +599,7 @@ def callers(
     parent, name = _split_qualified(target)
 
     with index.connect() as session:
-        named = [hit for hit in session.symbols_named(name, None, None, None) if hit.place.is_live]
+        named = [hit for hit in session.symbols_named(name, parent=None, kind=None, path=None) if hit.place.is_live]
         targets = [hit for hit in named if not parent or (hit.parent or "").lower() == parent.lower()]
         if not targets:
             return f"No symbol called {target!r}. Use find to search by part of a name."
@@ -587,7 +631,15 @@ def callers(
                 continue
 
             symbols = session.symbols_in_blob(place.blob_row)
-            calls = _calls_in(place.path, text, matcher, definitions, owner, is_member, symbols)
+            calls = _calls_in(
+                place.path,
+                text,
+                matcher=matcher,
+                definitions=definitions,
+                owner=owner,
+                is_member=is_member,
+                symbols=symbols,
+            )
             if not calls:
                 continue
 
@@ -596,7 +648,9 @@ def callers(
             if found.shown < limit:
                 shown = calls[: limit - found.shown]
                 marks = {number: POSSIBLE_MARK for number, _, certain in shown if not certain}
-                found.lines.extend(_lines_under_symbols(place.ref, symbols, [(n, line) for n, line, _ in shown], marks))
+                found.lines.extend(
+                    _lines_under_symbols(place.ref, symbols, matches=[(n, line) for n, line, _ in shown], marks=marks)
+                )
                 found.shown += len(shown)
 
     if not found.lines:
@@ -607,6 +661,7 @@ def callers(
 def _calls_in(
     path: str,
     text: str,
+    *,
     matcher: re.Pattern[str],
     definitions: set[tuple[str, int]],
     owner: str | None,
@@ -624,17 +679,22 @@ def _calls_in(
         if (path, number) not in definitions
         for match in matcher.finditer(line)
     ]
-    roles = text_roles(path, text, [(number, column + 1) for number, column, _ in matches])
+    roles = text_roles(path, text, positions=[(number, column + 1) for number, column, _ in matches])
 
     best: dict[int, bool] = {}
     for (number, column, end), role in zip(matches, roles):
         if role == Role.COMMENT:
             continue
-        if role == Role.STRING and not _names_a_callable(lines[number - 1], column, end):
+        if role == Role.STRING and not _names_a_callable(lines[number - 1], start=column, end=end):
             continue
 
         enclosing = _innermost([symbol for symbol in symbols if symbol.kind in TYPE_KINDS], number)
-        certainty = _call_certainty(lines[number - 1][:column], owner, is_member, enclosing.name if enclosing else None)
+        certainty = _call_certainty(
+            lines[number - 1][:column],
+            owner=owner,
+            is_member=is_member,
+            enclosing=enclosing.name if enclosing else None,
+        )
         if certainty is not None:
             best[number] = best.get(number, False) or (certainty and role == Role.CODE)
 
@@ -646,7 +706,7 @@ def _calls_in(
 CALLABLE_STRING = re.compile(r"""["'][\w\\]*(::|\.|@|->)?$""")
 
 
-def _names_a_callable(line: str, start: int, end: int) -> bool:
+def _names_a_callable(line: str, *, start: int, end: int) -> bool:
     """
     True when the match from start to end, inside a string, is a callable's name, such as 'Deepgram::transcribe',
     and not a word in text, such as 'ai-scribe-transcribe-chunk'.
@@ -656,6 +716,7 @@ def _names_a_callable(line: str, start: int, end: int) -> bool:
 
 def _call_certainty(
     before: str,
+    *,
     owner: str | None,
     is_member: bool,
     enclosing: str | None,
@@ -694,11 +755,12 @@ def _call_certainty(
 def outline(
     index: Index,
     path: str,
+    *,
     ref: str | None = None,
 ) -> str:
     """Every symbol in one file with its line range, indented by nesting. With a ref, the file is read at that ref."""
     if ref is not None:
-        return _outline_at_ref(index, path, ref)
+        return _outline_at_ref(index, path, ref=ref)
 
     index.refresh()
     return _outline(index, path)
@@ -717,9 +779,10 @@ def _outline(index: Index, path: str) -> str:
 def _outline_at_ref(
     index: Index,
     path: str,
+    *,
     ref: str,
 ) -> str:
-    places = _resolve_tree_path(_tree_at(index, ref)[1], ref, path)
+    places = _resolve_tree_path(_tree_at(index, ref)[1], ref, path=path)
     if len(places) != 1:
         return _path_choices(path, places)
 
@@ -746,6 +809,7 @@ def _outline_lines(place: Place, symbols: list[SymbolHit]) -> str:
 def show(
     index: Index,
     target: str,
+    *,
     path: str | None = None,
     ref: str | None = None,
     deps: DependencyReach = DependencyReach.FALLBACK,
@@ -757,15 +821,16 @@ def show(
     says when a symbol is looked for in the installed dependencies.
     """
     if ref is not None:
-        return _show_at_ref(index, target, path, ref)
+        return _show_at_ref(index, target, path=path, ref=ref)
 
     index.refresh()
-    return _show(index, target, path, deps)
+    return _show(index, target, path=path, deps=deps)
 
 
 def _show(
     index: Index,
     target: str,
+    *,
     path: str | None,
     deps: DependencyReach,
 ) -> str:
@@ -780,18 +845,19 @@ def _show(
         if len(places) == 1:
             first = int(line_range.group(2)) if line_range else 1
             last = int(line_range.group(3) or first) if line_range else None
-            return _source(index, places[0], first, last)
+            return _source(index, places[0], first=first, last=last)
 
         parent, name = _split_qualified(target)
+        wanted = NameQuery(name, (name,), parent, None, path)
         hits = [
             hit
-            for hit in _find_symbols(session, name, [name], parent, None, path)
+            for hit in _find_symbols(session, wanted)
             if hit.name.lower() == name.lower() and not in_dependencies(hit.place.path)
         ]
 
     notes: list[str] = []
     if deps != DependencyReach.FALLBACK or not hits:
-        package_hits, notes = _dependency_symbols(index, name, [name], parent, None, deps)
+        package_hits, notes = _dependency_symbols(index, wanted, deps=deps)
         # When dependencies were asked for, their source is what the reader wants to see first.
         hits = (
             _ranked(package_hits[:1]) + hits if deps != DependencyReach.FALLBACK else hits + _ranked(package_hits[:1])
@@ -808,12 +874,13 @@ def _show(
 def _show_at_ref(
     index: Index,
     target: str,
+    *,
     path: str | None,
     ref: str,
 ) -> str:
     commit, tree = _tree_at(index, ref)
     line_range = LINE_RANGE.fullmatch(target)
-    places = _resolve_tree_path(tree, ref, line_range.group(1) if line_range else target)
+    places = _resolve_tree_path(tree, ref, path=line_range.group(1) if line_range else target)
 
     if line_range and len(places) != 1:
         return _path_choices(line_range.group(1), places)
@@ -821,12 +888,18 @@ def _show_at_ref(
     if len(places) == 1:
         first = int(line_range.group(2)) if line_range else 1
         last = int(line_range.group(3) or first) if line_range else None
-        return _source(index, places[0], first, last)
+        return _source(index, places[0], first=first, last=last)
 
     parent, name = _split_qualified(target)
-    symbols = _symbols_at(index, commit, tree, ref, name, path)
+    symbols = _symbols_at(index, commit, tree=tree, ref=ref, text=name, path_filter=path)
     hits = _ranked(
-        [[hit for hit in symbols if hit.name.lower() == name.lower() and _parent_and_kind_match(hit, parent, None)]]
+        [
+            [
+                hit
+                for hit in symbols
+                if hit.name.lower() == name.lower() and _parent_and_kind_match(hit, parent=parent, kind=None)
+            ]
+        ]
     )
 
     if not hits:
@@ -839,7 +912,7 @@ def _show_at_ref(
 def _show_hits(index: Index, hits: list[SymbolHit]) -> str:
     """The source of the best hit, and where the others are."""
     best = hits[0]
-    output = _source(index, best.place, best.line, best.end_line)
+    output = _source(index, best.place, first=best.line, last=best.end_line)
 
     if len(hits) > 1:
         others = [f"  {hit.place.ref}:{hit.line}" for hit in hits[1:6]]
@@ -885,10 +958,10 @@ def required_literals(pattern: str) -> list[str]:
             runs.append(run[:-1])
             run = ""
             if character == "{":
-                position = _index_or_end(pattern, "}", position)
+                position = _index_or_end(pattern, "}", start=position)
         elif character == "[":
             # In a class like "[]a]" or "[\]a]" the first "]" does not end the class. We don't work out where it ends.
-            closing = _index_or_end(pattern, "]", position + 1)
+            closing = _index_or_end(pattern, "]", start=position + 1)
             if pattern.startswith(("]", "^]"), position + 1) or "\\" in pattern[position:closing]:
                 return []
             runs.append(run)
@@ -905,7 +978,7 @@ def required_literals(pattern: str) -> list[str]:
     return [run for run in runs if len(run) >= 3]
 
 
-def _index_or_end(pattern: str, character: str, start: int) -> int:
+def _index_or_end(pattern: str, character: str, *, start: int) -> int:
     found = pattern.find(character, start)
     return found if found != -1 else len(pattern)
 
@@ -923,47 +996,47 @@ def _split_qualified(name: str) -> tuple[str | None, str]:
 
 def _find_symbols(
     session: IndexSession,
-    name: str,
-    words: list[str],
-    parent: str | None,
-    kind: Kind | None,
-    path: str | None,
+    wanted: NameQuery,
+    *,
     scope: Scope = Scope.WORKING_TREE,
 ) -> list[SymbolHit]:
     """Symbols matching a name, best first: exact, then prefix, then containing every word."""
+    name, parent, kind, path = wanted.name, wanted.parent, wanted.kind, wanted.path
     return _ranked(
         [
-            session.symbols_named(name, parent, kind, path, scope),
-            session.symbols_starting_with(name, parent, kind, path, scope),
-            session.symbols_containing_all(words, parent, kind, path, scope),
+            session.symbols_named(name, parent=parent, kind=kind, path=path, scope=scope),
+            session.symbols_starting_with(name, parent=parent, kind=kind, path=path, scope=scope),
+            session.symbols_containing_all(list(wanted.words), parent=parent, kind=kind, path=path, scope=scope),
         ]
     )
 
 
-def _find_abbreviated(
-    session: IndexSession,
-    name: str,
-    parent: str | None,
-    kind: Kind | None,
-    path: str | None,
-) -> tuple[list[SymbolHit], list[Place]]:
+class Abbreviated(NamedTuple):
+    """The symbols and paths that match a query as an abbreviation."""
+
+    hits: list[SymbolHit]
+    paths: list[Place]
+
+
+def _find_abbreviated(session: IndexSession, wanted: NameQuery) -> Abbreviated:
     """
     Symbols and paths that match the query as an abbreviation, for when nothing matches it more closely.
     "reqcontroller" finds "RequestController".
     """
-    letters = "".join(NAME_WORDS.findall(name)).lower()
+    parent, kind, path = wanted.parent, wanted.kind, wanted.path
+    letters = "".join(NAME_WORDS.findall(wanted.name)).lower()
     if len(letters) < 2:
-        return [], []
+        return Abbreviated([], [])
 
-    symbols = session.symbols_containing_in_order(list(letters), parent, kind, path)
+    symbols = session.symbols_containing_in_order(list(letters), parent=parent, kind=kind, path=path)
     hits = _ranked([[hit for hit in symbols if _is_abbreviation(letters, hit.name)]])
 
     if kind:
-        return hits, []
+        return Abbreviated(hits, [])
 
     places = session.places_containing_in_order(list(letters))
     paths = [place for place in places if _is_abbreviation(letters, place.path) and path_matches(place.path, path)]
-    return hits, sorted(paths, key=lambda place: (place.is_deleted, len(place.path)))
+    return Abbreviated(hits, sorted(paths, key=lambda place: (place.is_deleted, len(place.path))))
 
 
 def _is_abbreviation(letters: str, text: str) -> bool:
@@ -1015,6 +1088,7 @@ def _ranked(tiers: list[list[SymbolHit]]) -> list[SymbolHit]:
 def _find_paths(
     session: IndexSession,
     words: list[str],
+    *,
     path_filter: str | None,
     scope: Scope = Scope.WORKING_TREE,
 ) -> list[Place]:
@@ -1052,6 +1126,7 @@ def _path_choices(path: str, places: list[Place]) -> str:
 def _matching_lines(
     session: IndexSession,
     texts: Iterator[tuple[Place, str | None]],
+    *,
     matcher: re.Pattern[str],
     limit: int,
     candidates: int,
@@ -1081,8 +1156,14 @@ def _matching_lines(
             continue
 
         symbols = session.symbols_in_blob(place.blob_row)
-        definitions = {symbol.line: DEFINITION_MARK for symbol in symbols if _is_defined_by(symbol, matches, matcher)}
-        found.lines.extend(_lines_under_symbols(place.ref, symbols, matches[: settings.LINES_PER_FILE], definitions))
+        definitions = {
+            symbol.line: DEFINITION_MARK
+            for symbol in symbols
+            if _is_defined_by(symbol, matches=matches, matcher=matcher)
+        }
+        found.lines.extend(
+            _lines_under_symbols(place.ref, symbols, matches=matches[: settings.LINES_PER_FILE], marks=definitions)
+        )
         found.shown += min(len(matches), settings.LINES_PER_FILE)
         if len(matches) > settings.LINES_PER_FILE:
             found.lines.append(f"({len(matches) - settings.LINES_PER_FILE} more matching lines in {place.ref})")
@@ -1093,6 +1174,7 @@ def _matching_lines(
 
 def _is_defined_by(
     symbol: SymbolHit,
+    *,
     matches: list[tuple[int, str]],
     matcher: re.Pattern[str],
 ) -> bool:
@@ -1111,6 +1193,7 @@ def _is_defined_by(
 def _lines_under_symbols(
     ref: str,
     symbols: list[SymbolHit],
+    *,
     matches: list[tuple[int, str]],
     marks: dict[int, str] | None = None,
 ) -> list[str]:
@@ -1139,7 +1222,7 @@ def _innermost(symbols: list[SymbolHit], line: int) -> SymbolHit | None:
     return min(around, key=lambda symbol: symbol.end_line - symbol.line) if around else None
 
 
-def _source(index: Index, place: Place, first: int, last: int | None) -> str:
+def _source(index: Index, place: Place, *, first: int, last: int | None) -> str:
     """Lines first to last of a file, under a "path:first-last" heading. last=None means to the end."""
     text = _read(index, place)
     if text is None:
@@ -1182,6 +1265,7 @@ def _tree_at(index: Index, ref: str) -> tuple[str, dict[str, str]]:
 def _resolve_tree_path(
     tree: dict[str, str],
     ref: str,
+    *,
     path: str,
 ) -> list[Place]:
     """The file a path names at a rf, the way _resolve_path finds it in the working tree."""
@@ -1195,6 +1279,7 @@ def _resolve_tree_path(
 def _paths_at(
     tree: dict[str, str],
     ref: str,
+    *,
     words: list[str],
     path_filter: str | None,
 ) -> list[Place]:
@@ -1210,6 +1295,7 @@ def _paths_at(
 def _symbols_at(
     index: Index,
     commit: str,
+    *,
     tree: dict[str, str],
     ref: str,
     text: str,
@@ -1223,7 +1309,7 @@ def _symbols_at(
     places = sorted(
         (
             Place(path, tree[path], 0, AtRef(ref))
-            for path in git.paths_containing(index.root, commit, text)
+            for path in git.paths_containing(index.root, commit, text=text)
             if path in tree and path_matches(path, path_filter)
         ),
         key=lambda place: len(place.path),
@@ -1242,7 +1328,7 @@ def _hit(place: Place, symbol: Symbol) -> SymbolHit:
     return SymbolHit(place, symbol.name, symbol.kind, symbol.parent, symbol.line, symbol.end_line, symbol.signature)
 
 
-def _parent_and_kind_match(hit: SymbolHit, parent: str | None, kind: Kind | None) -> bool:
+def _parent_and_kind_match(hit: SymbolHit, *, parent: str | None, kind: Kind | None) -> bool:
     """The filters the index applies in SQL, for symbols that were parsed without the index."""
     if parent and (hit.parent or "").lower() != parent.lower():
         return False

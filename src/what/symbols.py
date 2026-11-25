@@ -104,7 +104,7 @@ def extract(path: str, text: str) -> list[Symbol]:
 
     lines = split_lines(text)
     found: dict[tuple[str, int], Symbol] = {}
-    _add_structure(parsed.structure, None, found)
+    _add_structure(parsed.structure, parent=None, found=found)
 
     # The flat symbol list has constants and types that the structure tree leaves out.
     for symbol in parsed.symbols:
@@ -129,6 +129,7 @@ def extract(path: str, text: str) -> list[Symbol]:
 def text_roles(
     path: str,
     text: str,
+    *,
     positions: list[tuple[int, int]],
 ) -> list[Role]:
     """
@@ -225,6 +226,7 @@ def _kind(value: object) -> Kind:
 
 def _add_structure(
     items: list[grammars.StructureItem],
+    *,
     parent: str | None,
     found: dict[tuple[str, int], Symbol],
 ) -> None:
@@ -247,7 +249,7 @@ def _add_structure(
                 signature[: settings.MAX_SIGNATURE_LENGTH],
             )
 
-        _add_structure(item.children, item.name or parent, found)
+        _add_structure(item.children, parent=item.name or parent, found=found)
 
 
 def _enclosing(found: dict[tuple[str, int], Symbol], line: int) -> str | None:

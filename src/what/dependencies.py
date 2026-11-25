@@ -12,7 +12,7 @@ import json
 import os
 import re
 import tomllib
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -21,8 +21,8 @@ from typing import Any, NamedTuple, cast
 from what import models
 from what.config import settings
 from what.index import Index
-from what.models import InPackage, Place, SymbolHit
-from what.symbols import Kind, extract_many
+from what.models import InPackage, NameQuery, Place, SymbolHit
+from what.symbols import extract_many
 
 
 class Ecosystem(StrEnum):
@@ -112,7 +112,7 @@ class Installed:
 LOCKFILES = ["composer.lock", "package-lock.json", "uv.lock", "poetry.lock"]
 
 
-def installed(index: Index, transitive: bool) -> Installed:
+def installed(index: Index, *, transitive: bool) -> Installed:
     """
     The dependencies installed for the repository, as its lockfiles record them. Only direct dependencies are listed
     unless transitive is True.
@@ -202,15 +202,17 @@ def package_rows(index: Index, packages: Iterable[Package]) -> dict[int, Package
 
     with models.connect_dependencies(_index_path(index)) as session:
         for package in packages:
-            row = session.package_row(package.ecosystem, package.name, package.cache_version)
+            row = session.package_row(package.ecosystem, package.name, version=package.cache_version)
             if row is None:
                 sources = list(_source_files(index, package))
                 files = dict(zip([path for path, _ in sources], extract_many(sources)))
                 with session.write_transaction():
                     # Another process may have indexed the package while this one read it.
-                    row = session.package_row(package.ecosystem, package.name, package.cache_version)
+                    row = session.package_row(package.ecosystem, package.name, version=package.cache_version)
                     if row is None:
-                        row = session.insert_package(package.ecosystem, package.name, package.cache_version, files)
+                        row = session.insert_package(
+                            package.ecosystem, package.name, version=package.cache_version, files=files
+                        )
             rows[row] = package
 
     return rows
@@ -218,20 +220,19 @@ def package_rows(index: Index, packages: Iterable[Package]) -> dict[int, Package
 
 def find_symbols(
     index: Index,
-    packages: dict[int, Package],
-    name: str,
-    words: list[str],
-    parent: str | None,
-    kind: Kind | None,
+    packages: Mapping[int, Package],
+    *,
+    query: NameQuery,
 ) -> list[list[SymbolHit]]:
     """Symbols in the packages matching a name, as three tiers: exact, then prefix, then containing every word."""
     rows = list(packages)
+    parent, kind = query.parent, query.kind
 
     with models.connect_dependencies(_index_path(index)) as session:
         tiers = [
-            session.symbols_named(name, parent, kind, rows),
-            session.symbols_starting_with(name, parent, kind, rows),
-            session.symbols_containing_all(words, parent, kind, rows),
+            session.symbols_named(query.name, parent=parent, kind=kind, packages=rows),
+            session.symbols_starting_with(query.name, parent=parent, kind=kind, packages=rows),
+            session.symbols_containing_all(list(query.words), parent=parent, kind=kind, packages=rows),
         ]
 
     return [[_hit(packages[symbol.package], symbol) for symbol in tier] for tier in tiers]

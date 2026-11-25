@@ -190,9 +190,9 @@ def test_moving_head_reads_only_the_default_branch_again(
     read: list[str] = []
     original = git_module.changed_files
 
-    def changed_files(root: Path, base: str, tip: str) -> dict[str, str]:
+    def changed_files(root: Path, *, base: str, tip: str) -> dict[str, str]:
         read.append(tip)
-        return original(root, base, tip)
+        return original(root, base=base, tip=tip)
 
     monkeypatch.setattr(git_module, "changed_files", changed_files)
 
