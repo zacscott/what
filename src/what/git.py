@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from what.config import settings
 
@@ -19,7 +20,7 @@ class UnknownRef(Exception):
     """A ref the user named is not a branch, tag or commit in the repository."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Deletion:
     """A file that a commit deleted, and the blob that held its last content."""
 
@@ -29,7 +30,7 @@ class Deletion:
     date: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Branch:
     """
     A branch other than the one checked out. date is the time of its last commit, in seconds since 1970. remote is
@@ -63,7 +64,15 @@ def head(root: Path) -> str | None:
         return None
 
 
-def working_tree(root: Path) -> tuple[dict[str, str], set[str], list[str]]:
+class WorkingTree(NamedTuple):
+    """The tracked files with their blob ids, the tracked files that changed, and the untracked files."""
+
+    tracked: dict[str, str]
+    changed: set[str]
+    untracked: list[str]
+
+
+def working_tree(root: Path) -> WorkingTree:
     """
     The tracked files with their blob ids, the tracked files that changed, and the untracked files. The three git
     commands run at the same time, because each one takes 10 to 30ms and none of them depends on another.
@@ -85,7 +94,7 @@ def working_tree(root: Path) -> tuple[dict[str, str], set[str], list[str]]:
         outputs.append(stdout)
 
     staged, changed, untracked = outputs
-    return _tracked(staged), set(_split(changed)), _split(untracked)
+    return WorkingTree(_tracked(staged), set(_split(changed)), _split(untracked))
 
 
 def _tracked(output: bytes) -> dict[str, str]:

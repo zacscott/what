@@ -7,13 +7,25 @@ import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from functools import cache
-from pathlib import Path
+from typing import assert_never
 
 from what import dependencies, git
 from what.config import settings
 from what.dependencies import DependencyReach
 from what.index import Index
-from what.models import IndexSession, Place, Scope, SymbolHit, age, path_matches
+from what.models import (
+    AtRef,
+    Deleted,
+    IndexSession,
+    InPackage,
+    Live,
+    OnBranch,
+    Place,
+    Scope,
+    SymbolHit,
+    age,
+    path_matches,
+)
 from what.symbols import Symbol, extract, split_lines, text_roles
 
 TYPE_KINDS = {"class", "interface", "trait", "enum", "struct", "type", "module", "namespace", "impl"}
@@ -183,9 +195,9 @@ def _dependency_symbols(
     installed = dependencies.installed(index, deps == DependencyReach.ALL)
     packages = dependencies.package_rows(index, installed.packages)
     if not packages:
-        return [], installed.notes
+        return [], list(installed.notes)
 
-    return dependencies.find_symbols(index, packages, name, words, parent, kind), installed.notes
+    return dependencies.find_symbols(index, packages, name, words, parent, kind), list(installed.notes)
 
 
 def _find_on_branches(
@@ -233,7 +245,7 @@ def _read_branches(index: Index) -> tuple[list[git.Branch], list[str]]:
 
 def _branches_heading(places: list[Place], found_here: bool) -> str:
     """The line before the matches on other branches, such as "not in this checkout; found on 2 other branches:"."""
-    count = len({place.branch for place in places})
+    count = len({place.origin.name for place in places if isinstance(place.origin, OnBranch)})
     branches = "1 other branch" if count == 1 else f"{count} other branches"
     return f"also on {branches}:" if found_here else f"not in this checkout; found on {branches}:"
 
@@ -345,7 +357,7 @@ def grep(
             found.add(
                 _matching_lines(session, _file_texts(index, places), _matcher(pattern, regex)[0], limit, len(places))
             )
-        notes = installed.notes
+        notes = list(installed.notes)
 
     output = [found.summary(), *found.lines] if found.lines else []
     if branches or not found.lines:
@@ -389,7 +401,7 @@ def _grep_on_branches(
     return [heading, found.summary(), *found.lines, *_fetch_note(index, branches)], notes
 
 
-@dataclass
+@dataclass(slots=True)
 class TextMatches:
     """
     The output lines of a text search, and how many lines and files matched in all. A search shows up to its limit
@@ -483,7 +495,7 @@ def _matcher(pattern: str, regex: bool) -> tuple[re.Pattern[str], list[str]]:
 
 def _file_texts(index: Index, places: list[Place]) -> Iterator[tuple[Place, str | None]]:
     """The text of files in installed dependencies, read from disk in order."""
-    return ((place, index.read_text(Path(place.package_folder or "") / place.path)) for place in places)
+    return ((place, _read(index, place)) for place in places)
 
 
 def _branch_texts(
@@ -533,7 +545,7 @@ def callers(
     parent, name = _split_qualified(target)
 
     with index.connect() as session:
-        named = [hit for hit in session.symbols_named(name, None, None, None) if hit.place.in_working_tree]
+        named = [hit for hit in session.symbols_named(name, None, None, None) if hit.place.is_live]
         targets = [hit for hit in named if not parent or (hit.parent or "").lower() == parent.lower()]
         if not targets:
             return f"No symbol called {target!r}. Use find to search by part of a name."
@@ -941,7 +953,7 @@ def _find_abbreviated(
 
     places = session.places_containing_in_order(list(letters))
     paths = [place for place in places if _is_abbreviation(letters, place.path) and path_matches(place.path, path)]
-    return hits, sorted(paths, key=lambda place: (place.commit is not None, len(place.path)))
+    return hits, sorted(paths, key=lambda place: (place.is_deleted, len(place.path)))
 
 
 def _is_abbreviation(letters: str, text: str) -> bool:
@@ -984,8 +996,7 @@ def _ranked(tiers: list[list[SymbolHit]]) -> list[SymbolHit]:
             if key in ranked:
                 continue
             kind_rank = 0 if hit.kind in TYPE_KINDS else 1 if hit.kind in CALLABLE_KINDS else 2
-            is_deleted = hit.place.commit is not None
-            rank = (tier, is_deleted, kind_rank, _is_secondary(hit.place.path), len(hit.place.path))
+            rank = (tier, hit.place.is_deleted, kind_rank, _is_secondary(hit.place.path), len(hit.place.path))
             ranked[key] = (rank, hit)
 
     return [hit for _, hit in sorted(ranked.values(), key=lambda entry: entry[0])]
@@ -1000,7 +1011,7 @@ def _find_paths(
     """Live then deleted files whose path contains every word, shortest path first."""
     return sorted(
         (place for place in session.places_containing_all(words, scope) if path_matches(place.path, path_filter)),
-        key=lambda place: (place.commit is not None, len(place.path)),
+        key=lambda place: (place.is_deleted, len(place.path)),
     )
 
 
@@ -1009,7 +1020,11 @@ def _resolve_path(session: IndexSession, path: str) -> list[Place]:
     deleted = DELETED_REF.fullmatch(path)
     if deleted:
         commit, path = deleted.groups()
-        return [place for place in _resolve_path(session, path) if place.commit and place.commit.startswith(commit)]
+        return [
+            place
+            for place in _resolve_path(session, path)
+            if isinstance(place.origin, Deleted) and place.origin.commit.startswith(commit)
+        ]
 
     path = path.removeprefix("./")
     exact = session.places_at_path(path)
@@ -1133,13 +1148,16 @@ def _source(index: Index, place: Place, first: int, last: int | None) -> str:
 
 def _read(index: Index, place: Place) -> str | None:
     """The text of a file, from disk or from git. None when it is binary, too big or gone."""
-    if place.in_working_tree:
-        return index.read_live(place.path)
-    if place.package_folder is not None:
-        return index.read_text(Path(place.package_folder) / place.path)
-
-    content = next(iter(git.read_blobs(index.root, [place.oid])))[1]
-    return content.decode("utf-8", "replace") if content else None
+    match place.origin:
+        case Live():
+            return index.read_live(place.path)
+        case InPackage(folder=folder):
+            return index.read_text(folder / place.path)
+        case Deleted() | AtRef() | OnBranch():
+            content = next(iter(git.read_blobs(index.root, [place.oid])))[1]
+            return content.decode("utf-8", "replace") if content else None
+        case _:
+            assert_never(place.origin)
 
 
 def _tree_at(index: Index, ref: str) -> tuple[str, dict[str, str]]:
@@ -1159,9 +1177,9 @@ def _resolve_tree_path(
     """The file a path names at a rf, the way _resolve_path finds it in the working tree."""
     path = path.removeprefix(ref + ":").removeprefix("./")
     if path in tree:
-        return [Place(path, tree[path], 0, tree=ref)]
+        return [Place(path, tree[path], 0, AtRef(ref))]
 
-    return [Place(known, oid, 0, tree=ref) for known, oid in tree.items() if known.endswith("/" + path)]
+    return [Place(known, oid, 0, AtRef(ref)) for known, oid in tree.items() if known.endswith("/" + path)]
 
 
 def _paths_at(
@@ -1172,7 +1190,7 @@ def _paths_at(
 ) -> list[Place]:
     """Files at a ref whose path contains every word, shortest path first."""
     found = [
-        Place(path, oid, 0, tree=ref)
+        Place(path, oid, 0, AtRef(ref))
         for path, oid in tree.items()
         if all(word.lower() in path.lower() for word in words) and path_matches(path, path_filter)
     ]
@@ -1194,7 +1212,7 @@ def _symbols_at(
     """
     places = sorted(
         (
-            Place(path, tree[path], 0, tree=ref)
+            Place(path, tree[path], 0, AtRef(ref))
             for path in git.paths_containing(index.root, commit, text)
             if path in tree and path_matches(path, path_filter)
         ),

@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 _unavailable: set[str] = set()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Symbol:
     """
     One definition in a file. Lines count from 1. For example:

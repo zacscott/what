@@ -15,11 +15,30 @@ from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
+from typing import NamedTuple
 
 from what import directory, git, models
 from what.config import settings
-from what.models import IndexSession
+from what.models import BranchListing, IndexSession
 from what.symbols import Symbol, extract_many
+
+
+class StaleFile(NamedTuple):
+    """
+    A file in the working tree that the index must read again. oid is set for a file git tracks unchanged, and stat
+    for a file whose blob id has to be worked out from its content.
+    """
+
+    path: str
+    oid: str | None
+    stat: str | None
+
+
+class BranchState(NamedTuple):
+    """The other branches, and how many of them are still to be read."""
+
+    branches: list[git.Branch]
+    pending: int
 
 
 class Index:
@@ -64,7 +83,7 @@ class Index:
         with self.connect() as session:
             known = session.known_files()
             # Each entry is (path, blob id, stat). The blob id is None until the file is read.
-            stale: list[tuple[str, str | None, str | None]] = []
+            stale: list[StaleFile] = []
             present: set[str] = set()
 
             for path in unhashed:
@@ -72,15 +91,15 @@ class Index:
                 if stat is None:
                     continue
                 present.add(path)
-                if path not in known or known[path][1] != stat:
-                    stale.append((path, None, stat))
+                if path not in known or known[path].stat != stat:
+                    stale.append(StaleFile(path, None, stat))
 
             for path, oid in tracked.items():
                 if path in unhashed:
                     continue
                 present.add(path)
-                if path not in known or known[path][0] != oid:
-                    stale.append((path, oid, None))
+                if path not in known or known[path].oid != oid:
+                    stale.append(StaleFile(path, oid, None))
 
             for start in range(0, len(stale), settings.BATCH_SIZE):
                 self._index_files(session, stale[start : start + settings.BATCH_SIZE])
@@ -124,7 +143,7 @@ class Index:
             session.delete_unused_blobs()
             session.set_meta("history_head", current)
 
-    def refresh_branches(self, most: int | None = None) -> tuple[list[git.Branch], int]:
+    def refresh_branches(self, most: int | None = None) -> BranchState:
         """
         Index the files that each other branch changes. Returns the branches, and how many of them are still to be
         read. When more than most branches have moved, none are read here, so a search doesn't wait minutes on a
@@ -136,7 +155,7 @@ class Index:
         """
         current = git.head(self.root) if self.in_git else None
         if current is None:
-            return [], 0
+            return BranchState([], 0)
 
         oldest = time.time() - settings.BRANCH_MAX_AGE_DAYS * 86400
         branches = [branch for branch in git.other_branches(self.root) if branch.is_default or branch.date >= oldest]
@@ -145,10 +164,12 @@ class Index:
         with self.connect() as session, self._lock("branches") as locked:
             known = session.known_branches()
             stale = [
-                branch for branch in branches if known.get(branch.name) != (branch.tip, _base_key(branch, current))
+                branch
+                for branch in branches
+                if known.get(branch.name) != BranchListing(branch.tip, _base_key(branch, current))
             ]
             if not locked or (most is not None and len(stale) > most):
-                return branches, len(stale)
+                return BranchState(branches, len(stale))
 
             def changed_files(branch: git.Branch) -> dict[str, str]:
                 base = current if branch.is_default else git.merge_base(self.root, default or current, branch.tip)
@@ -166,7 +187,7 @@ class Index:
             if stale or gone:
                 session.delete_unused_blobs()
 
-        return branches, 0
+        return BranchState(branches, 0)
 
     def build_in_background(self) -> None:
         """
@@ -229,7 +250,7 @@ class Index:
     def _index_files(
         self,
         session: IndexSession,
-        batch: list[tuple[str, str | None, str | None]],
+        batch: list[StaleFile],
     ) -> None:
         # Reading and hashing happens before the transaction, so the write lock is held only for the inserts.
         read: list[tuple[str, str, str | None, str | None]] = []

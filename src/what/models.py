@@ -17,6 +17,7 @@ from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple, assert_never
 
 from what.symbols import Symbol
 
@@ -133,51 +134,90 @@ class Scope(enum.Enum):
     BRANCHES = enum.auto()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
+class Live:
+    """A file in the working tree, read from disk."""
+
+
+@dataclass(frozen=True, slots=True)
+class Deleted:
+    """A file that HEAD's history deleted, read from git as it was in the commit before commit."""
+
+    commit: str
+
+
+@dataclass(frozen=True, slots=True)
+class AtRef:
+    """A file read from git at a ref, which holds the ref as the user gave it, such as "origin/dev"."""
+
+    ref: str
+
+
+@dataclass(frozen=True, slots=True)
+class OnBranch:
+    """A file on another branch, read from git. date is the time of the branch's last commit, in seconds snice 1970."""
+
+    name: str
+    date: int
+
+
+@dataclass(frozen=True, slots=True)
+class InPackage:
+    """
+    A file in an installed dependency, read from disk. label names the package, such as
+    "vendor: robmorgan/phinx@0.16.1", and the file's path is relative to folder.
+    """
+
+    label: str
+    folder: Path
+
+
+# Where a file's content comes from.
+type Origin = Live | Deleted | AtRef | OnBranch | InPackage
+
+
+@dataclass(frozen=True, slots=True)
 class Place:
-    """
-    Where a file's content comes from. commit is set only for a deleted file. tree is set only for a file read at a
-    git ref, and holds the ref as the user gave it, such as "origin/dev". branch is set only for a file on another
-    branch, with branch_date the time of the branch's last commit. package is set only for a file in an installed
-    dependency, with the package's label, such as "vendor: robmorgan/phinx@0.16.1". Its path is then relative to
-    package_folder.
-    """
+    """A file a search found: its path, the git blob id and index row of its content, and where it cones from."""
 
     path: str
     oid: str
     blob_row: int
-    commit: str | None = None
-    tree: str | None = None
-    branch: str | None = None
-    branch_date: int | None = None
-    package: str | None = None
-    package_folder: str | None = None
+    origin: Origin = Live()
 
     @property
     def ref(self) -> str:
         """
         How output names the file. A deleted file is named the way git names a file at a commit, in the commit
         before the one that deleted it, such as "a1b2c3d4^:legacy/split.py". A file at a ref is named
-        "origin/dev:src/a.py".
+        "origin/dev:src/a.py", and a file on a branch "origin/dev (3 days ago) src/a.py".
         """
-        if self.package is not None:
-            return f"{self.package} {self.path}"
-        if self.branch is not None:
-            return f"{self.branch} ({age(self.branch_date or 0)}) {self.path}"
-        if self.tree is not None:
-            return f"{self.tree}:{self.path}"
-        if self.commit is not None:
-            return f"{self.commit[:8]}^:{self.path}"
-
-        return self.path
+        match self.origin:
+            case Live():
+                return self.path
+            case Deleted(commit=commit):
+                return f"{commit[:8]}^:{self.path}"
+            case AtRef(ref=ref):
+                return f"{ref}:{self.path}"
+            case OnBranch(name=name, date=date):
+                return f"{name} ({age(date)}) {self.path}"
+            case InPackage(label=label):
+                return f"{label} {self.path}"
+            case _:
+                assert_never(self.origin)
 
     @property
-    def in_working_tree(self) -> bool:
-        """True when the file is read from disk, and False when it is read from git."""
-        return self.commit is None and self.tree is None and self.branch is None and self.package is None
+    def is_live(self) -> bool:
+        """True when the file is in the working tree."""
+        return isinstance(self.origin, Live)
+
+    @property
+    def is_deleted(self) -> bool:
+        """True when HEAD's history deleted the file."""
+        return isinstance(self.origin, Deleted)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SymbolHit:
     """
     One symbol a search found, and the file it is in. The searches take the same
@@ -191,6 +231,33 @@ class SymbolHit:
     line: int
     end_line: int
     signature: str
+
+
+class KnownFile(NamedTuple):
+    """
+    What the index holds for a path in the working tree: its blob id, and the stat it had when read. stat is None for
+    a file git tracks unchanged, whose blob id says when it changes.
+    """
+
+    oid: str
+    stat: str | None
+
+
+class BranchListing(NamedTuple):
+    """
+    The commits a branch's tip and HEAD pointed at when the branch's files were listed. head is empty for a branch
+    that isn't compared with HEAD.
+    """
+
+    tip: str
+    head: str
+
+
+class SqlCondition(NamedTuple):
+    """A condition for a WHERE clause, and the values for its "?" marks."""
+
+    sql: str
+    parameters: list[str]
 
 
 class _Session:
@@ -433,10 +500,10 @@ class IndexSession(_Session):
         """Forget a value the index keeps about itself."""
         self._db.execute("DELETE FROM meta WHERE key = ?", (key,))
 
-    def known_files(self) -> dict[str, tuple[str, str | None]]:
+    def known_files(self) -> dict[str, "KnownFile"]:
         """Every path in the file table, with its blob id and stat."""
         rows = self._db.execute("SELECT f.path, b.oid, f.stat FROM files f JOIN blobs b ON b.id = f.blob")
-        return {path: (oid, stat) for path, oid, stat in rows}
+        return {path: KnownFile(oid, stat) for path, oid, stat in rows}
 
     def save_file(self, path: str, blob: int, stat: str | None) -> None:
         """Record the content a path holds, replacing what it held before."""
@@ -457,9 +524,10 @@ class IndexSession(_Session):
         """Forget every deleted path, so the next history build starts again."""
         self._db.execute("DELETE FROM deleted")
 
-    def known_branches(self) -> dict[str, tuple[str, str]]:
+    def known_branches(self) -> dict[str, "BranchListing"]:
         """Every indexed branch, with the commits its tip and HEAD pointed at when its files were listed."""
-        return {name: (tip, head) for name, tip, head in self._db.execute("SELECT name, tip, head FROM branches")}
+        rows = self._db.execute("SELECT name, tip, head FROM branches")
+        return {name: BranchListing(tip, head) for name, tip, head in rows}
 
     def save_branch_files(self, name: str, files: list[tuple[str, int]]) -> None:
         """Record the contetn of files a branch changed, as (path, blob row)."""
@@ -520,7 +588,7 @@ class IndexSession(_Session):
             WHERE {condition} AND d.path NOT IN (SELECT path FROM files)
         """
 
-        return [Place(*row) for row in self._db.execute(sql, parameters + parameters)]
+        return [_working_tree_place(*row) for row in self._db.execute(sql, parameters + parameters)]
 
     def _places_with_text(self, literals: list[str], table: str) -> list[Place]:
         history = "t.commit_id" if table == "deleted" else "NULL"
@@ -528,7 +596,7 @@ class IndexSession(_Session):
 
         if not literals:
             sql = f"SELECT t.path, b.oid, b.id, {history} FROM {table} t JOIN blobs b ON b.id = t.blob ORDER BY t.path"
-            return [Place(*row) for row in self._db.execute(sql)]
+            return [_working_tree_place(*row) for row in self._db.execute(sql)]
 
         match = " AND ".join('"' + literal.replace('"', '""') + '"' for literal in literals)
         sql = f"""
@@ -538,7 +606,7 @@ class IndexSession(_Session):
             ORDER BY bm25(text_fts), t.path
         """
 
-        return [Place(*row) for row in self._db.execute(sql, (match,))]
+        return [_working_tree_place(*row) for row in self._db.execute(sql, (match,))]
 
     def _matching_symbols(
         self,
@@ -605,13 +673,13 @@ class IndexSession(_Session):
             if branch is not None and (file_path, blob, symbol[0], line) in seen:
                 continue
             seen.add((file_path, blob, symbol[0], line))
-            place = Place(file_path, oid, blob, commit, branch=branch, branch_date=date)
-            hits.append(SymbolHit(place, *symbol))
+            origin = OnBranch(branch, date) if branch is not None else Deleted(commit) if commit is not None else Live()
+            hits.append(SymbolHit(Place(file_path, oid, blob, origin), *symbol))
 
         return hits
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PackageSymbol:
     """One definition in an installed dependency. path is relative to the package's folder."""
 
@@ -755,10 +823,20 @@ def _open(path: Path) -> Generator[sqlite3.Connection]:
         db.close()
 
 
+def _working_tree_place(
+    path: str,
+    oid: str,
+    blob: int,
+    commit: str | None,
+) -> Place:
+    """A place from a row of the files or deleted table, where commit is set only for a deleted file."""
+    return Place(path, oid, blob, Deleted(commit) if commit is not None else Live())
+
+
 def _branch_places(rows: Iterable[tuple[str, str, int, str, int]]) -> list[Place]:
     """Places on other branches from rows of (path, blob id, blob row, branch, date), one for each content."""
     return _newest_per_content(
-        [Place(path, oid, blob, branch=branch, branch_date=date) for path, oid, blob, branch, date in rows]
+        [Place(path, oid, blob, OnBranch(branch, date)) for path, oid, blob, branch, date in rows]
     )
 
 
@@ -799,13 +877,13 @@ def path_matches(path: str, path_filter: str | None) -> bool:
     return path_filter.lower() in path.lower()
 
 
-def _path_sql(path_filter: str | None) -> tuple[str, list[str]]:
+def _path_sql(path_filter: str | None) -> SqlCondition:
     """The same test as path_matches, as a SQL condition on a column called path."""
     if not path_filter:
-        return "1", []
+        return SqlCondition("1", [])
     if any(wildcard in path_filter for wildcard in "*?["):
-        return "(path GLOB ? OR path GLOB ?)", [path_filter, "*/" + path_filter]
-    return "path LIKE ? ESCAPE '\\'", ["%" + _like_escape(path_filter) + "%"]
+        return SqlCondition("(path GLOB ? OR path GLOB ?)", [path_filter, "*/" + path_filter])
+    return SqlCondition("path LIKE ? ESCAPE '\\'", ["%" + _like_escape(path_filter) + "%"])
 
 
 def _marks(values: list[int]) -> str:
