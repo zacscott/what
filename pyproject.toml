@@ -1,6 +1,6 @@
 [project]
 name = "what"
-version = "0.1.1"
+version = "0.2.0"
 description = "Searches a git repository by symbol and text from the command line, deleted files included"
 readme = "README.md"
 requires-python = ">=3.12"
