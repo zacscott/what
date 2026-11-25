@@ -82,6 +82,7 @@ def test_find_matches_a_file_by_path(index: Index) -> None:
 
 def test_grep_names_the_enclosing_symbol(index: Index) -> None:
     assert search.grep(index, "str_repeat").splitlines() == [
+        "1 hit in 1 file",
         "src/BananaBender.php-3-public function bandana(int $count): string",
         "src/BananaBender.php:4:return str_repeat('banana', $count);",
     ]
@@ -90,9 +91,42 @@ def test_grep_names_the_enclosing_symbol(index: Index) -> None:
 def test_grep_searches_deleted_files_when_no_live_file_matches(index: Index) -> None:
     split = deleted(index, "legacy/split.py")
     assert search.grep(index, "cherry_sauce").splitlines() == [
+        "1 hit in 1 file",
         split + "-1-def banana_split(scoops: int) -> str:",
         split + ':2:topping = "cherry_sauce"',
     ]
+
+
+def test_grep_marks_the_line_that_defines_a_matching_symbol(index: Index, repo: Path) -> None:
+    (repo / "src/caller.php").write_text("<?php\nfunction feed() {\n    return (new BananaBender())->bandana(2);\n}\n")
+
+    output = search.grep(index, "bandana", path="src/").splitlines()
+
+    assert output[0] == "2 hits in 2 files"
+    assert sorted(output[1:]) == [
+        "src/BananaBender.php:3:public function bandana(int $count): string {" + search.DEFINITION_MARK,
+        "src/caller.php-2-function feed()",
+        "src/caller.php:3:return (new BananaBender())->bandana(2);",
+    ]
+
+
+def test_grep_counts_the_hits_it_leaves_out(index: Index, repo: Path) -> None:
+    for number in range(5):
+        (repo / f"src/many{number}.txt").write_text("pip\npip\n")
+
+    output = search.grep(index, "pip", path="many", limit=3).splitlines()
+
+    assert output[0] == "10 hits in 5 files, 4 shown. Use --limit or --path to see more."
+    assert len([line for line in output if ":pip" in line]) == 4
+
+
+def test_grep_prints_the_history_notice_only_for_a_deleted_file_search(index: Index) -> None:
+    with index.connect() as session:
+        session.delete_meta("history_head")
+
+    assert search.HISTORY_BUILDING not in search.grep(index, "str_repeat")
+    assert search.HISTORY_BUILDING not in search.find(index, "banana")
+    assert search.HISTORY_BUILDING in search.grep(index, "str_repeat", deleted=True)
 
 
 def test_grep_with_a_regex_and_a_pattern_too_short_for_the_index(index: Index) -> None:
@@ -231,12 +265,13 @@ def test_the_same_content_is_indexed_again_under_another_extension(
     (repo / "src/second.py").write_text(SPLIT)
 
     assert "src/second.py:1:def banana_split" in search.find(index, "banana_split")
-    assert search.grep(index, "cherry_sauce").startswith("src/second.py")
+    assert search.grep(index, "cherry_sauce").splitlines()[1].startswith("src/second.py")
 
 
 def test_line_numbers_ignore_form_feeds(index: Index, repo: Path) -> None:
     (repo / "src/feed.py").write_text("x = 1\f\n\n\ndef needle():\n    return 'haystack'\n")
     assert search.grep(index, "haystack").splitlines() == [
+        "1 hit in 1 file",
         "src/feed.py-4-def needle():",
         "src/feed.py:5:return 'haystack'",
     ]
@@ -269,6 +304,7 @@ def test_directory_mode_indexes_files_from_disk(plain_directory: Path, tmp_path:
         "src/BananaBender.php:3:public function bandana(int $count): string",
     ]
     assert search.grep(index, "str_repeat", commits=True).splitlines() == [
+        "1 hit in 1 file",
         "src/BananaBender.php-3-public function bandana(int $count): string",
         "src/BananaBender.php:4:return str_repeat('banana', $count);",
         "Commit search needs a git repository.",

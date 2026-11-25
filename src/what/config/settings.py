@@ -13,6 +13,10 @@ SHOW_MAX_LINES = 400
 
 # Limits on slow work.
 
+# How many candidate files a text search reads to count its hits, after it has shown its limit. A pattern with no
+# plain text makes every file a candidate.
+COUNT_FILES = 2000
+
 # How many deleted files a text search reads from git. Each one costs a blob read.
 DELETED_FILES_READ = 100
 

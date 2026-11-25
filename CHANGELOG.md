@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Changed
+
+- `grep` starts with the number of hits and files, such as `12 hits in 5 files, 4 shown`, so output cut by `head` or `--limit` says how much is missing.
+- `grep` marks the line that defines a matching symbol with `[definition]`.
+- The notice that the index of deleted files is not up to date appears only on `grep --deleted`.
+
 ## [0.1.1] - 2026-11-25
 
 ### Changed

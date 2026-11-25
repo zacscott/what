@@ -5,6 +5,7 @@ a path printed once, with its matches under it as "line: text".
 
 import re
 from collections.abc import Iterator
+from dataclasses import dataclass
 from functools import cache
 
 from what import git
@@ -27,6 +28,9 @@ LINE_RANGE = re.compile(r"(.+?):(\d+)(?:-(\d+))?")
 DELETED_REF = re.compile(r"([0-9a-f]{4,40})\^:(.+)")
 
 HISTORY_BUILDING = "(The index of deleted files is not up to date, so deleted files may be missing.)"
+
+# Ends a grep hit on the line that definse the symbol, so the definition stands out from the call sites.
+DEFINITION_MARK = "  [definition]"
 
 
 def lookup(
@@ -83,13 +87,13 @@ def _find(index: Index, query: str, kind: str | None, path: str | None, limit: i
             hits, paths = _find_abbreviated(session, name, parent, kind, path)
 
     if not hits and kind:
-        return f"No {kind} named {query!r}. Run find without kind to see other matches." + _history_note(index)
+        return f"No {kind} named {query!r}. Run find without kind to see other matches."
     if not hits and not paths:
         # A grammar can miss a definition, so the text of the files is searched before saying "nothing".
-        text_matches = _text_search(index, query, False, path, limit, False)
+        text_matches = _text_search(index, query, False, path, limit, False).lines
         if not text_matches:
-            return f"Nothing named or containing {query!r} in live or deleted files." + _history_note(index)
-        return "\n".join([f"No symbol or path named {query!r}. Text matches:", *text_matches]) + _history_note(index)
+            return f"Nothing named or containing {query!r} in live or deleted files."
+        return "\n".join([f"No symbol or path named {query!r}. Text matches:", *text_matches])
 
     output: list[str] = []
     shown = hits[:limit]
@@ -106,7 +110,7 @@ def _find(index: Index, query: str, kind: str | None, path: str | None, limit: i
         more_files = len({hit.place for hit in hits[limit:]} - set(by_place))
         output.append(f"+{len(hits) - limit} more symbols in {more_files} other files. Add path or kind to narrow.")
 
-    return "\n".join(output) + _history_note(index)
+    return "\n".join(output)
 
 
 def grep(
@@ -125,16 +129,51 @@ def grep(
     index.refresh()
 
     try:
-        output = _text_search(index, pattern, regex, path, limit, deleted)
+        found = _text_search(index, pattern, regex, path, limit, deleted)
     except re.error as error:
         return f"Invalid regex: {error}"
 
+    output = [found.summary(), *found.lines] if found.lines else []
     if commits:
         output.extend(_commits_changing(index, pattern))
 
+    # Only a search of deleted files can miss what the unfinished history build hasn't read yet.
+    note = _history_note(index) if deleted else ""
     if not output:
-        return f"No text matches for {pattern!r} in live or deleted files." + _history_note(index)
-    return "\n".join(output) + _history_note(index)
+        return f"No text matches for {pattern!r} in live or deleted files." + note
+    return "\n".join(output) + note
+
+
+@dataclass
+class TextMatches:
+    """
+    The output lines of a text search, and how many lines and files matched in all. A search shows up to its limit
+    but counts further, so the reader knows how much was left out.
+    """
+
+    lines: list[str]
+    shown: int = 0
+    hits: int = 0
+    files: int = 0
+    # Candidate files that weren't read, because counting stopped at settings.COUNT_FILES.
+    unread: int = 0
+
+    def add(self, other: "TextMatches") -> None:
+        self.lines.extend(other.lines)
+        self.shown += other.shown
+        self.hits += other.hits
+        self.files += other.files
+        self.unread += other.unread
+
+    def summary(self) -> str:
+        """The first line of the output, such as "112 hits in 31 files, 40 shown. Use --limit or --path to see more"."""
+        counted = f"{_plural(self.hits, 'hit')} in {_plural(self.files, 'file')}"
+        if self.unread:
+            counted += f" and {_plural(self.unread, 'more file')} not read"
+        if self.shown == self.hits and not self.unread:
+            return counted
+
+        return f"{counted}, {self.shown} shown. Use --limit or --path to see more."
 
 
 def _text_search(
@@ -144,8 +183,8 @@ def _text_search(
     path: str | None,
     limit: int,
     deleted: bool,
-) -> list[str]:
-    """The output lines of a text search, empty when nothing matches."""
+) -> TextMatches:
+    """The lines a text search matched, with no lines when nothing matches."""
     # The search ignores case unless the pattern has a capital letter in it. An escape like \S is not a capital.
     letters = re.sub(r"\\.", "", pattern) if regex else pattern
     flags = 0 if any(letter.isupper() for letter in letters) else re.IGNORECASE
@@ -156,14 +195,14 @@ def _text_search(
         live = [place for place in session.live_places_with_text(literals) if path_matches(place.path, path)]
         texts = ((place, index.read_live(place.path)) for place in live)
 
-        output = _matching_lines(session, texts, matcher, limit, len(live))
-        if output and not deleted:
-            return output
+        found = _matching_lines(session, texts, matcher, limit, len(live))
+        if found.lines and not deleted:
+            return found
 
         if not literals:
-            if output:
-                output.append("Deleted files need a pattern with 3 or more plain characters in a row.")
-            return output
+            if found.lines:
+                found.lines.append("Deleted files need a pattern with 3 or more plain characters in a row.")
+            return found
 
         gone = [place for place in session.deleted_places_with_text(literals) if path_matches(place.path, path)]
         blobs = git.read_blobs(index.root, [place.oid for place in gone[: settings.DELETED_FILES_READ]])
@@ -172,9 +211,9 @@ def _text_search(
             (place, content.decode("utf-8", "replace") if content else None) for place, (_, content) in zip(gone, blobs)
         )
 
-        output.extend(_matching_lines(session, deleted_texts, matcher, limit, len(gone)))
+        found.add(_matching_lines(session, deleted_texts, matcher, limit, len(gone)))
 
-    return output
+    return found
 
 
 def outline(index: Index, path: str) -> str:
@@ -441,17 +480,16 @@ def _matching_lines(
     matcher: re.Pattern[str],
     limit: int,
     candidates: int,
-) -> list[str]:
+) -> TextMatches:
     """
-    The output lines for the candidate files that really match, stopping once
-    limit matching lines are shown. candidates is how many files texts holds.
+    The output lines for the candidate files that really match, until limit matching lines are shown. The files after
+    that are only counted. candidates is how many files texts holds.
     """
-    output: list[str] = []
-    shown = 0
+    found = TextMatches([])
     read = 0
 
     for place, text in texts:
-        if shown >= limit:
+        if read >= settings.COUNT_FILES:
             break
         read += 1
         if text is None:
@@ -461,26 +499,31 @@ def _matching_lines(
         if not matches:
             continue
 
-        output.extend(
-            _lines_under_symbols(place.ref, session.symbols_in_blob(place.blob_row), matches[: settings.LINES_PER_FILE])
-        )
-        shown += min(len(matches), settings.LINES_PER_FILE)
-        if len(matches) > settings.LINES_PER_FILE:
-            output.append(f"({len(matches) - settings.LINES_PER_FILE} more matching lines in {place.ref})")
+        found.hits += len(matches)
+        found.files += 1
+        if found.shown >= limit:
+            continue
 
-    if candidates > read:
-        output.append(f"+{candidates - read} more files may match. Add path or a longer pattern to narrow.")
-    return output
+        symbols = session.symbols_in_blob(place.blob_row)
+        found.lines.extend(_lines_under_symbols(place.ref, symbols, matches[: settings.LINES_PER_FILE], matcher))
+        found.shown += min(len(matches), settings.LINES_PER_FILE)
+        if len(matches) > settings.LINES_PER_FILE:
+            found.lines.append(f"({len(matches) - settings.LINES_PER_FILE} more matching lines in {place.ref})")
+
+    found.unread = candidates - read
+    return found
 
 
 def _lines_under_symbols(
     ref: str,
     symbols: list[SymbolHit],
     matches: list[tuple[int, str]],
+    matcher: re.Pattern[str] | None = None,
 ) -> list[str]:
     """
     One file's matching lines as "path:line:text". Where the enclosing symbol changes, its first line comes before
-    them as a context line, "path-line-text", the way grep and ripgrep print context.
+    them as a context line, "path-line-text", the way grep and ripgrep print context. A line that defines a symbol
+    whose name the matcher matches ends with DEFINITION_MARK.
     """
     output: list[str] = []
     last_symbol: SymbolHit | None = None
@@ -490,7 +533,11 @@ def _lines_under_symbols(
         if symbol is not None and symbol != last_symbol and symbol.line != number:
             output.append(f"{ref}-{symbol.line}-{symbol.signature}")
         last_symbol = symbol
-        output.append(f"{ref}:{number}:{line.strip()[: settings.MAX_LINE_LENGTH]}")
+
+        text = line.strip()[: settings.MAX_LINE_LENGTH]
+        if matcher and any(other.line == number and matcher.search(other.name) for other in symbols):
+            text += DEFINITION_MARK
+        output.append(f"{ref}:{number}:{text}")
 
     return output
 
@@ -537,6 +584,10 @@ def _commits_changing(index: Index, text: str) -> list[str]:
 
 def _history_note(index: Index) -> str:
     return "" if index.history_is_current() else "\n" + HISTORY_BUILDING
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
 
 def _is_secondary(path: str) -> bool:
