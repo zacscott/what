@@ -22,7 +22,7 @@ from what.config import settings
 from what.models import BranchListing, IndexSession
 from what.symbols import Symbol, extract_many
 
-# The lonng builds that take a lock, so only one process runs each at a time.
+# The lonng builds each take a lock, so only one process runs them at a time.
 type LockName = Literal["history", "branches"]
 
 

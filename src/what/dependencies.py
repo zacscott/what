@@ -337,7 +337,8 @@ def _composer(root: Path, lockfile: str) -> LockfileRead:
 def _npm(root: Path, lockfile: str) -> LockfileRead:
     """
     The packages in package-lock.json that are installed in node_modules, and the (name, direct) of those that
-    aren't and of those installed at another version. Each key of "packages" is the folder the package is installed in, so nested installs are found too.
+    aren't and of those installed at another version. Each key of "packages" is the folder the package is
+    installed in, so nested installs are found too.
     """
     lock = _json(root / lockfile)
     packages: dict[str, Any] = lock.get("packages", {})
@@ -373,8 +374,9 @@ def _npm(root: Path, lockfile: str) -> LockfileRead:
 def _python(root: Path, lockfile: str) -> LockfileRead:
     """
     The packages in uv.lock or poetry.lock that are installed in the virtualenv, and the (name, direct) of those
-    that aren't and of those installed at another version. The direct dependencies are the ones pyproject.toml names. The files of each package come froom the
-    RECORD file pip and uv write, since a distribution's name is often not the name of its folder.
+    that aren't and of those installed at another version. The direct dependencies are the ones pyproject.toml
+    names. The files of each package come froom the RECORD file pip and uv write, since a distribution's name is
+    often not the name of its folder.
     """
     with open(root / lockfile, "rb") as file:
         lock = tomllib.load(file)

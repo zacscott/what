@@ -13,8 +13,8 @@ SHOW_MAX_LINES = 400
 
 # Limits on slow work.
 
-# How many candidate files a text search reads in all, once it has shown its limit and is only counting the hits it
-# leaves out. A pattern with no plain text makes every file a candidate.
+# How many candidate files a text search reads, after it shows its limit and only counts the hits it leaves out.
+# A pattern with no plain text makes every file a candidate.
 COUNT_FILES = 2000
 
 # Branches whose last commit is older than this many days are left out. They are rarely the answer, and a large
