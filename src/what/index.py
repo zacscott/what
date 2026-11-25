@@ -15,12 +15,15 @@ from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 from what import directory, git, models
 from what.config import settings
 from what.models import BranchListing, IndexSession
 from what.symbols import Symbol, extract_many
+
+# The lonng builds that take a lock, so only one process runs each at a time.
+type LockName = Literal["history", "branches"]
 
 
 class StaleFile(NamedTuple):
@@ -327,13 +330,13 @@ class Index:
 
         return [_add_blob(session, oid, path, text, parsed, index_text) for path, oid, text in contents]
 
-    def _is_locked(self, name: str) -> bool:
+    def _is_locked(self, name: LockName) -> bool:
         """True when another process holds one of the locks that _lock takes."""
         with self._lock(name) as locked:
             return not locked
 
     @contextmanager
-    def _lock(self, name: str) -> Generator[bool]:
+    def _lock(self, name: LockName) -> Generator[bool]:
         """
         Yield True when this process may run a long build, "history" or "branches". Several searches can
         run at once in one repository, and only one build should read every deleted file or every branch.

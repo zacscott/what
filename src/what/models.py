@@ -19,10 +19,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, assert_never
 
-from what.symbols import Symbol
+from what.symbols import Kind, Symbol
 
 # Changing the tables means raising this. An index with another version is rebuilt from nothing.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # How many rows one tier of a symbol search fetches before ranking.
 TIER_FETCH = 300
@@ -92,7 +92,7 @@ CREATE TABLE meta (
 """
 
 # Changing the dependency tables means raising this. A dependency index with another version is rebuilt from nothing.
-DEPENDENCY_SCHEMA_VERSION = 1
+DEPENDENCY_SCHEMA_VERSION = 2
 
 # The index of installed dependencies, which every repository shares. A row in packages is one version of one
 # package, and is written only once its files and symbols are all in. Paths are relative to the package's folder.
@@ -226,7 +226,7 @@ class SymbolHit:
 
     place: Place
     name: str
-    kind: str
+    kind: Kind
     parent: str | None
     line: int
     end_line: int
@@ -362,7 +362,7 @@ class IndexSession(_Session):
         self,
         name: str,
         parent: str | None,
-        kind: str | None,
+        kind: Kind | None,
         path: str | None,
         scope: Scope = Scope.WORKING_TREE,
     ) -> list[SymbolHit]:
@@ -373,7 +373,7 @@ class IndexSession(_Session):
         self,
         prefix: str,
         parent: str | None,
-        kind: str | None,
+        kind: Kind | None,
         path: str | None,
         scope: Scope = Scope.WORKING_TREE,
     ) -> list[SymbolHit]:
@@ -386,7 +386,7 @@ class IndexSession(_Session):
         self,
         words: list[str],
         parent: str | None,
-        kind: str | None,
+        kind: Kind | None,
         path: str | None,
         scope: Scope = Scope.WORKING_TREE,
     ) -> list[SymbolHit]:
@@ -408,7 +408,7 @@ class IndexSession(_Session):
         self,
         parts: list[str],
         parent: str | None,
-        kind: str | None,
+        kind: Kind | None,
         path: str | None,
     ) -> list[SymbolHit]:
         """Symbols whose name contains every part, in order, with anything between."""
@@ -427,7 +427,7 @@ class IndexSession(_Session):
         )
 
         place = Place("", "", blob)
-        return [SymbolHit(place, *row) for row in rows]
+        return [SymbolHit(place, name, Kind(kind), *rest) for name, kind, *rest in rows]
 
     def blob_row(self, oid: str, parsed_as: str) -> int | None:
         """The row id of a content parsed this way, or None when the index hasn't seen it."""
@@ -613,7 +613,7 @@ class IndexSession(_Session):
         condition: str,
         parameters: list[str],
         parent: str | None,
-        kind: str | None,
+        kind: Kind | None,
         path_filter: str | None,
         scope: Scope,
     ) -> list[SymbolHit]:
@@ -629,7 +629,7 @@ class IndexSession(_Session):
             parameters = [*parameters, parent]
         if kind:
             condition += " AND s.kind = ?"
-            parameters = [*parameters, kind.lower()]
+            parameters = [*parameters, kind]
 
         columns = "s.name, s.kind, s.parent, s.line, s.end_line, s.signature, b.oid, b.id"
         path_condition, path_parameters = _path_sql(path_filter)
@@ -674,7 +674,8 @@ class IndexSession(_Session):
                 continue
             seen.add((file_path, blob, symbol[0], line))
             origin = OnBranch(branch, date) if branch is not None else Deleted(commit) if commit is not None else Live()
-            hits.append(SymbolHit(Place(file_path, oid, blob, origin), *symbol))
+            name, kind, *rest = symbol
+            hits.append(SymbolHit(Place(file_path, oid, blob, origin), name, Kind(kind), *rest))
 
         return hits
 
@@ -686,7 +687,7 @@ class PackageSymbol:
     package: int
     path: str
     name: str
-    kind: str
+    kind: Kind
     parent: str | None
     line: int
     end_line: int
@@ -741,7 +742,7 @@ class DependencySession(_Session):
         self,
         name: str,
         parent: str | None,
-        kind: str | None,
+        kind: Kind | None,
         packages: list[int],
     ) -> list[PackageSymbol]:
         """Symbols with exactly this name, ignoring case."""
@@ -751,7 +752,7 @@ class DependencySession(_Session):
         self,
         prefix: str,
         parent: str | None,
-        kind: str | None,
+        kind: Kind | None,
         packages: list[int],
     ) -> list[PackageSymbol]:
         """Symbols whose name starts with this text."""
@@ -761,7 +762,7 @@ class DependencySession(_Session):
         self,
         words: list[str],
         parent: str | None,
-        kind: str | None,
+        kind: Kind | None,
         packages: list[int],
     ) -> list[PackageSymbol]:
         """Symbols whose name contains every word."""
@@ -775,7 +776,7 @@ class DependencySession(_Session):
         condition: str,
         parameters: list[str],
         parent: str | None,
-        kind: str | None,
+        kind: Kind | None,
         packages: list[int],
     ) -> list[PackageSymbol]:
         values: list[str | int] = [*parameters]
@@ -784,14 +785,15 @@ class DependencySession(_Session):
             values.append(parent)
         if kind:
             condition += " AND kind = ?"
-            values.append(kind.lower())
+            values.append(kind)
 
         sql = f"""
             SELECT package, path, name, kind, parent, line, end_line, signature FROM package_symbols
             WHERE {condition} AND package IN ({_marks(packages)})
             LIMIT {TIER_FETCH}
         """
-        return [PackageSymbol(*row) for row in self._db.execute(sql, [*values, *packages])]
+        rows = self._db.execute(sql, [*values, *packages])
+        return [PackageSymbol(package, path, name, Kind(kind), *rest) for package, path, name, kind, *rest in rows]
 
 
 @contextmanager

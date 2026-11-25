@@ -10,6 +10,7 @@ from what import search
 from what.config import settings
 from what.git import UnknownRef
 from what.index import Index
+from what.symbols import Kind
 
 
 def test_find_lists_definitions_under_their_path(index: Index) -> None:
@@ -20,13 +21,13 @@ def test_find_lists_definitions_under_their_path(index: Index) -> None:
 
 
 def test_find_ranks_an_exact_name_first_and_filters_by_kind(index: Index) -> None:
-    assert search.find(index, "bandana", kind="method").splitlines() == [
+    assert search.find(index, "bandana", kind=Kind.METHOD).splitlines() == [
         "src/BananaBender.php:3:public function bandana(int $count): string",
     ]
 
 
 def test_find_with_a_kind_that_matches_nothing_does_not_search_text(index: Index) -> None:
-    assert search.find(index, "str_repeat", kind="class").startswith("No class named 'str_repeat'.")
+    assert search.find(index, "str_repeat", kind=Kind.CLASS).startswith("No class named 'str_repeat'.")
 
 
 def test_find_sees_an_uncommitted_file_and_forgets_it_when_removed(
@@ -63,7 +64,7 @@ def test_find_matches_an_abbreviation_only_at_the_start_of_words(index: Index, r
         "src/controllers.php:2:class RequestController",
     ]
     assert search.find(index, "reqcontroller") == search.find(index, "reqController")
-    assert search.find(index, "reqCont", kind="class").splitlines() == [
+    assert search.find(index, "reqCont", kind=Kind.CLASS).splitlines() == [
         "src/controllers.php:2:class RequestController",
     ]
 
@@ -217,7 +218,7 @@ def test_lookup_shows_a_line_range(index: Index) -> None:
 
 
 def test_lookup_with_a_kind_searches_names_only(index: Index) -> None:
-    assert search.lookup(index, "split.py", kind="function").startswith("No function named 'split.py'.")
+    assert search.lookup(index, "split.py", kind=Kind.FUNCTION).startswith("No function named 'split.py'.")
 
 
 def test_a_file_added_back_is_no_longer_listed_as_deleted(index: Index, repo: Path) -> None:
@@ -271,7 +272,7 @@ def test_show_finds_one_method_among_hundreds_with_the_same_name(index: Index, r
     classes = [f"class C{number}:\n    def run(self):\n        return {number}\n" for number in range(400)]
     (repo / "src/many.py").write_text("\n".join(classes))
     assert "return 399" in search.show(index, "C399.run")
-    assert "def run(self):" in search.find(index, "run", path="many", kind="function", limit=500)
+    assert "def run(self):" in search.find(index, "run", path="many", kind=Kind.FUNCTION, limit=500)
 
 
 def test_the_same_content_is_indexed_again_under_another_extension(
@@ -380,7 +381,7 @@ def test_find_at_a_ref_finds_a_class_that_was_deleted_later(index: Index, repo: 
     git(repo, "rm", "-q", "src/BananaBender.php")
     git(repo, "commit", "-q", "-m", "Remove the bender")
 
-    assert search.find(index, "BananaBender", kind="class", ref="HEAD~1").splitlines() == [
+    assert search.find(index, "BananaBender", kind=Kind.CLASS, ref="HEAD~1").splitlines() == [
         "HEAD~1:src/BananaBender.php:2:class BananaBender extends Lady",
     ]
 
@@ -399,3 +400,10 @@ def test_show_at_a_ref_says_when_the_symbol_is_not_there(index: Index) -> None:
 def test_an_unknown_ref_raises_an_error_that_names_it(index: Index) -> None:
     with pytest.raises(UnknownRef, match="'no-such-branch' is not a branch, tag or commit"):
         search.find(index, "banana", ref="no-such-branch")
+
+
+def test_a_kind_the_grammar_pack_has_no_name_for_is_read_from_its_json(index: Index, repo: Path) -> None:
+    (repo / "src/ripe.c").write_text("#define BANANA_COUNT 3\ntypedef struct bunch bunch_t;\n")
+
+    assert search.find(index, "BANANA_COUNT", kind=Kind.CONSTANT).startswith("src/ripe.c:1:")
+    assert search.find(index, "bunch_t", kind=Kind.TYPE).startswith("src/ripe.c:2:")

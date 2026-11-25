@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from enum import StrEnum
 from functools import cache
 from typing import TYPE_CHECKING
 
@@ -18,6 +20,33 @@ if TYPE_CHECKING:
 _unavailable: set[str] = set()
 
 
+class Kind(StrEnum):
+    """What a symbol is. These are the kinds the tree-sitter grammar pack reports."""
+
+    CLASS = "class"
+    CONSTANT = "constant"
+    ENUM = "enum"
+    FUNCTION = "function"
+    IMPL = "impl"
+    INTERFACE = "interface"
+    METHOD = "method"
+    MODULE = "module"
+    NAMESPACE = "namespace"
+    STRUCT = "struct"
+    TRAIT = "trait"
+    TYPE = "type"
+    VARIABLE = "variable"
+    OTHER = "other"
+
+
+class Role(StrEnum):
+    """What a position in a file sits in."""
+
+    CODE = "code"
+    COMMENT = "comment"
+    STRING = "string"
+
+
 @dataclass(frozen=True, slots=True)
 class Symbol:
     """
@@ -27,7 +56,7 @@ class Symbol:
     """
 
     name: str
-    kind: str
+    kind: Kind
     parent: str | None
     line: int
     end_line: int
@@ -87,7 +116,7 @@ def extract(path: str, text: str) -> list[Symbol]:
             signature = lines[line - 1].strip() if line <= len(lines) else symbol.name
             found[(symbol.name, line)] = Symbol(
                 symbol.name,
-                str(symbol.kind).lower(),
+                _kind(symbol.kind),
                 _enclosing(found, line),
                 line,
                 symbol.span.end_line + 1,
@@ -101,7 +130,7 @@ def text_roles(
     path: str,
     text: str,
     positions: list[tuple[int, int]],
-) -> list[str]:
+) -> list[Role]:
     """
     What each position in a file sits in: "comment", "string" or "code". A position is (line, column), both counted
     from 1 and in characters. A string that is a statement on its own, suh as a Python docstring, counts as a comment.
@@ -114,18 +143,18 @@ def text_roles(
 
     language = grammars.detect_language_from_path(path)
     if language is None or language in settings.NO_SYMBOLS or language in _unavailable:
-        return ["code"] * len(positions)
+        return [Role.CODE] * len(positions)
 
     try:
         tree = grammars.get_parser(language).parse(text.encode())
     except grammars.DownloadError:
         _unavailable.add(language)
-        return ["code"] * len(positions)
+        return [Role.CODE] * len(positions)
     except grammars.Error:
-        return ["code"] * len(positions)
+        return [Role.CODE] * len(positions)
 
     lines = split_lines(text)
-    roles: list[str] = []
+    roles: list[Role] = []
 
     for line, column in positions:
         # tree-sitter counts rows from 0 and columns in bytes.
@@ -136,16 +165,16 @@ def text_roles(
     return roles
 
 
-def _role(node: Node | None) -> str:
+def _role(node: Node | None) -> Role:
     """Whether a syntax node is in a comment, in a string or in code, from the nodes around it."""
     while node is not None:
         if "comment" in node.type:
-            return "comment"
+            return Role.COMMENT
         if "string" in node.type:
-            return "comment" if _is_lone_string(node) else "string"
+            return Role.COMMENT if _is_lone_string(node) else Role.STRING
         node = node.parent
 
-    return "code"
+    return Role.CODE
 
 
 def _is_lone_string(node: Node) -> bool:
@@ -181,6 +210,19 @@ def _workers() -> ProcessPoolExecutor:
     return ProcessPoolExecutor(mp_context=multiprocessing.get_context("spawn"))
 
 
+def _kind(value: object) -> Kind:
+    """
+    The kind of a symbol the grammar pack found. The pack writes a kind it has no name for as JSON, such as
+    {"other": "constant"}, so the name inside is used when it is one of ours.
+    """
+    text = str(value).lower()
+    if text.startswith("{"):
+        text = str(json.loads(text).get("other", Kind.OTHER))
+
+    # A kind outside the list, such as a macro, is kept as other, which a search can still find by name.
+    return Kind(text) if text in Kind else Kind.OTHER
+
+
 def _add_structure(
     items: list[grammars.StructureItem],
     parent: str | None,
@@ -198,7 +240,7 @@ def _add_structure(
 
             found[(item.name, line)] = Symbol(
                 item.name,
-                str(item.kind).lower(),
+                _kind(item.kind),
                 parent,
                 line,
                 item.span.end_line + 1,

@@ -9,6 +9,7 @@ import click
 from what import dependencies, directory, git, search
 from what.dependencies import DependencyReach
 from what.index import Index
+from what.symbols import Kind
 
 DESCRIPTION = """\
 An index of this git repository: every symbol, every line of text, and every
@@ -40,7 +41,9 @@ BRANCHES_HELP = "also search other branches; without it they are searched only w
 DEPS_HELP = "also search the direct dependencies installed from the lockfiles"
 ALL_DEPS_HELP = "also search every installed dependency, the dependencies of dependencies included"
 REF_HELP = "search the files at this branch, tag or commit in place of the working tree"
-KIND_HELP = "only this kind: class, function, method, interface, enum..."
+KIND_HELP = "only symbols of this kind"
+# --kind accepts only the kinds the index holds, so a typo is an error and not an empty result.
+KIND_TYPE = click.Choice([kind.value for kind in Kind], case_sensitive=False)
 
 
 class _LookupWhenNoCommand(click.Group):
@@ -97,7 +100,7 @@ def main() -> None:
 
 @app.command(hidden=True)
 @click.argument("query", nargs=-1, required=True)
-@click.option("--kind", help=KIND_HELP)
+@click.option("--kind", type=KIND_TYPE, help=KIND_HELP)
 @click.option("--path", help=PATH_HELP)
 @click.option("--limit", default=30, show_default=True)
 @click.option("--ref", help=REF_HELP)
@@ -116,12 +119,12 @@ def lookup(
 ) -> None:
     """Find a name, list what a file defines or print a line range. what runs this when no command is given."""
     reach = _reach(deps, all_deps)
-    print(search.lookup(_searchable_index(), " ".join(query), kind, path, limit, ref, branches, reach))
+    print(search.lookup(_searchable_index(), " ".join(query), _kind(kind), path, limit, ref, branches, reach))
 
 
 @app.command()
 @click.argument("query", nargs=-1, required=True)
-@click.option("--kind", help=KIND_HELP)
+@click.option("--kind", type=KIND_TYPE, help=KIND_HELP)
 @click.option("--path", help=PATH_HELP)
 @click.option("--limit", default=30, show_default=True)
 @click.option("--ref", help=REF_HELP)
@@ -140,7 +143,7 @@ def find(
 ) -> None:
     """Find where a class, function, method, type or file is defined, by name or part of one."""
     reach = _reach(deps, all_deps)
-    print(search.find(_searchable_index(), " ".join(query), kind, path, limit, ref, branches, reach))
+    print(search.find(_searchable_index(), " ".join(query), _kind(kind), path, limit, ref, branches, reach))
 
 
 @app.command()
@@ -202,6 +205,11 @@ def show(
 ) -> None:
     """Print the source of one symbol ("Banana.bend"), a line range ("src/a.py:45-80") or a file."""
     print(search.show(_searchable_index(), target, path, ref, _reach(deps, all_deps)))
+
+
+def _kind(value: str | None) -> Kind | None:
+    """The --kind option as a Kind. click has already checked tha tit is one."""
+    return Kind(value.lower()) if value else None
 
 
 def _reach(deps: bool, all_deps: bool) -> DependencyReach:

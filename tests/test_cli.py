@@ -125,3 +125,10 @@ def test_an_unknown_ref_exits_with_an_error(cache: Path, monkeypatch: pytest.Mon
         cli.main()
 
     assert exit.value.code != 0
+
+
+def test_a_kind_that_does_not_exist_is_refused(cache: Path) -> None:
+    result = runner.invoke(cli.app, ["find", "banana", "--kind", "clas"], prog_name="what")
+
+    assert result.exit_code == 2
+    assert "'clas' is not one of" in result.output

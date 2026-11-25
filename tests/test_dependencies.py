@@ -9,6 +9,7 @@ from conftest import git
 from what import search
 from what.dependencies import DependencyReach
 from what.index import Index
+from what.symbols import Kind
 
 TABLE = """<?php
 namespace Phinx\\Db;
@@ -118,8 +119,8 @@ def test_two_repositories_with_the_same_version_share_one_index_entry(
 def test_a_transitive_dependency_is_found_only_with_all_deps(index: Index, repo: Path) -> None:
     install_composer(repo, {"robmorgan/phinx": "0.16.1", "symfony/helper": "6.0.0"}, ["robmorgan/phinx"])
 
-    assert search.find(index, "Helper", kind="class").startswith("No class named 'Helper'")
-    assert search.find(index, "Helper", kind="class", deps=DependencyReach.ALL).splitlines() == [
+    assert search.find(index, "Helper", kind=Kind.CLASS).startswith("No class named 'Helper'")
+    assert search.find(index, "Helper", kind=Kind.CLASS, deps=DependencyReach.ALL).splitlines() == [
         "vendor: symfony/helper@6.0.0 src/Phinx/Db/Table.php:4:class Helper",
     ]
 

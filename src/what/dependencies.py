@@ -14,6 +14,7 @@ import re
 import tomllib
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
@@ -21,7 +22,15 @@ from what import models
 from what.config import settings
 from what.index import Index
 from what.models import InPackage, Place, SymbolHit
-from what.symbols import extract_many
+from what.symbols import Kind, extract_many
+
+
+class Ecosystem(StrEnum):
+    """The package manager that installs a dependency."""
+
+    COMPOSER = "composer"
+    NPM = "npm"
+    PYTHON = "python"
 
 
 class DependencyReach(enum.Enum):
@@ -43,10 +52,10 @@ class Package:
     One installed dependency. folder holds its files. files lists the paths of its source files, relative to
     folder, when the package manager records them. Otherwise folder is walked. For example:
 
-        Package("composer", "robmorgan/phinx", "0.16.1", "", "vendor", Path("/repo/vendor/robmorgan/phinx"), None, True)
+        Package(Ecosystem.COMPOSER, "robmorgan/phinx", "0.16.1", "", "vendor", Path("/repo/vendor/robmorgan/phinx"), None, True)
     """
 
-    ecosystem: str
+    ecosystem: Ecosystem
     name: str
     version: str
     # What pins the content beyond the version, such as the commit of a Composer "dev-main" package. Empty when the
@@ -213,7 +222,7 @@ def find_symbols(
     name: str,
     words: list[str],
     parent: str | None,
-    kind: str | None,
+    kind: Kind | None,
 ) -> list[list[SymbolHit]]:
     """Symbols in the packages matching a name, as three tiers: exact, then prefix, then containing every word."""
     rows = list(packages)
@@ -316,7 +325,9 @@ def _composer(root: Path, lockfile: str) -> LockfileRead:
         # The installed package is what's on disk, so its version and commit are what the index is keyed on.
         source = cast(dict[str, Any], install)
         pin = source.get("source", {}).get("reference") or source.get("dist", {}).get("reference") or ""
-        package = Package("composer", name, install["version"], pin, "vendor", folder.resolve(), None, name in direct)
+        package = Package(
+            Ecosystem.COMPOSER, name, install["version"], pin, "vendor", folder.resolve(), None, name in direct
+        )
         found.append(package)
 
     return LockfileRead(found, missing, stale)
@@ -353,7 +364,7 @@ def _npm(root: Path, lockfile: str) -> LockfileRead:
         pin = entry.get("integrity") or entry.get("resolved") or "" if version == entry["version"] else ""
         if version != entry["version"]:
             stale.append(Unlisted(name, is_direct))
-        found.append(Package("npm", name, version, pin, "node_modules", folder, None, is_direct))
+        found.append(Package(Ecosystem.NPM, name, version, pin, "node_modules", folder, None, is_direct))
 
     return LockfileRead(found, missing, stale)
 
@@ -399,7 +410,7 @@ def _python(root: Path, lockfile: str) -> LockfileRead:
         # A package from git can change under one version, so its commit is part of the key.
         pin = source.get("git", "") if installed_version == version else ""
         files = _record_files(record)
-        found.append(Package("python", name, installed_version, pin, "site-packages", site, files, is_direct))
+        found.append(Package(Ecosystem.PYTHON, name, installed_version, pin, "site-packages", site, files, is_direct))
 
     return LockfileRead(found, missing, stale)
 

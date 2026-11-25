@@ -11,6 +11,7 @@ from what import git as git_module
 from what import search
 from what.config import settings
 from what.index import Index
+from what.symbols import Kind
 
 
 def commit_file(repo: Path, path: str, text: str, message: str) -> None:
@@ -54,7 +55,7 @@ def test_a_branch_merged_into_the_default_branch_is_never_searched(index: Index,
     git(repo, "merge", "-q", "--ff-only", "merged")
     commit_file(repo, "src/BananaBender.php", BENDER, "Stop ripening")
 
-    assert search.find(index, "ripen", kind="function").startswith("No function named 'ripen'")
+    assert search.find(index, "ripen", kind=Kind.FUNCTION).startswith("No function named 'ripen'")
     assert "merged" not in search.grep(index, "ripen", branches=True)
 
 
@@ -91,7 +92,7 @@ def test_the_default_branch_shows_what_the_checked_out_branch_changed(index: Ind
     git(repo, "checkout", "-q", "-b", "feature/rename")
     commit_file(repo, "src/BananaBender.php", BENDER.replace("bandana", "headscarf"), "Rename the method")
 
-    assert search.find(index, "bandana", kind="method").splitlines() == [
+    assert search.find(index, "bandana", kind=Kind.METHOD).splitlines() == [
         "not in this checkout; found on 1 other branch:",
         "main (just now) src/BananaBender.php:3:public function bandana(int $count): string",
     ]

@@ -26,10 +26,20 @@ from what.models import (
     age,
     path_matches,
 )
-from what.symbols import Symbol, extract, split_lines, text_roles
+from what.symbols import Kind, Role, Symbol, extract, split_lines, text_roles
 
-TYPE_KINDS = {"class", "interface", "trait", "enum", "struct", "type", "module", "namespace", "impl"}
-CALLABLE_KINDS = {"function", "method"}
+TYPE_KINDS = {
+    Kind.CLASS,
+    Kind.INTERFACE,
+    Kind.TRAIT,
+    Kind.ENUM,
+    Kind.STRUCT,
+    Kind.TYPE,
+    Kind.MODULE,
+    Kind.NAMESPACE,
+    Kind.IMPL,
+}
+CALLABLE_KINDS = {Kind.FUNCTION, Kind.METHOD}
 
 # The words of a name or path, split at case changes, digits and punctuation. For example
 # "getHTTPRequest_v2" gives get, HTTP, Request, v and 2.
@@ -58,7 +68,7 @@ RECEIVER = re.compile(r"([\w$\\]*)\s*(::|\?->|->|\?\.|\.|\\)\s*$")
 def lookup(
     index: Index,
     query: str,
-    kind: str | None = None,
+    kind: Kind | None = None,
     path: str | None = None,
     limit: int = 30,
     ref: str | None = None,
@@ -92,7 +102,7 @@ def lookup(
 def _lookup_at_ref(
     index: Index,
     query: str,
-    kind: str | None,
+    kind: Kind | None,
     path: str | None,
     limit: int,
     ref: str,
@@ -111,7 +121,7 @@ def _lookup_at_ref(
 def find(
     index: Index,
     query: str,
-    kind: str | None = None,
+    kind: Kind | None = None,
     path: str | None = None,
     limit: int = 30,
     ref: str | None = None,
@@ -133,7 +143,7 @@ def find(
 def _find(
     index: Index,
     query: str,
-    kind: str | None,
+    kind: Kind | None,
     path: str | None,
     limit: int,
     branches: bool,
@@ -185,7 +195,7 @@ def _dependency_symbols(
     name: str,
     words: list[str],
     parent: str | None,
-    kind: str | None,
+    kind: Kind | None,
     deps: DependencyReach,
 ) -> tuple[list[list[SymbolHit]], list[str]]:
     """
@@ -205,7 +215,7 @@ def _find_on_branches(
     name: str,
     words: list[str],
     parent: str | None,
-    kind: str | None,
+    kind: Kind | None,
     path: str | None,
     limit: int,
     found_here: bool,
@@ -291,7 +301,7 @@ def _found_lines(
 def _find_at_ref(
     index: Index,
     query: str,
-    kind: str | None,
+    kind: Kind | None,
     path: str | None,
     limit: int,
     ref: str,
@@ -618,15 +628,15 @@ def _calls_in(
 
     best: dict[int, bool] = {}
     for (number, column, end), role in zip(matches, roles):
-        if role == "comment":
+        if role == Role.COMMENT:
             continue
-        if role == "string" and not _names_a_callable(lines[number - 1], column, end):
+        if role == Role.STRING and not _names_a_callable(lines[number - 1], column, end):
             continue
 
         enclosing = _innermost([symbol for symbol in symbols if symbol.kind in TYPE_KINDS], number)
         certainty = _call_certainty(lines[number - 1][:column], owner, is_member, enclosing.name if enclosing else None)
         if certainty is not None:
-            best[number] = best.get(number, False) or (certainty and role == "code")
+            best[number] = best.get(number, False) or (certainty and role == Role.CODE)
 
     return [(number, lines[number - 1], certain) for number, certain in sorted(best.items())]
 
@@ -916,7 +926,7 @@ def _find_symbols(
     name: str,
     words: list[str],
     parent: str | None,
-    kind: str | None,
+    kind: Kind | None,
     path: str | None,
     scope: Scope = Scope.WORKING_TREE,
 ) -> list[SymbolHit]:
@@ -934,7 +944,7 @@ def _find_abbreviated(
     session: IndexSession,
     name: str,
     parent: str | None,
-    kind: str | None,
+    kind: Kind | None,
     path: str | None,
 ) -> tuple[list[SymbolHit], list[Place]]:
     """
@@ -1232,11 +1242,11 @@ def _hit(place: Place, symbol: Symbol) -> SymbolHit:
     return SymbolHit(place, symbol.name, symbol.kind, symbol.parent, symbol.line, symbol.end_line, symbol.signature)
 
 
-def _parent_and_kind_match(hit: SymbolHit, parent: str | None, kind: str | None) -> bool:
+def _parent_and_kind_match(hit: SymbolHit, parent: str | None, kind: Kind | None) -> bool:
     """The filters the index applies in SQL, for symbols that were parsed without the index."""
     if parent and (hit.parent or "").lower() != parent.lower():
         return False
-    return not kind or hit.kind == kind.lower()
+    return not kind or hit.kind == kind
 
 
 def _commits_changing(index: Index, text: str) -> list[str]:

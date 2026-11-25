@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+
+- A symbol the grammar pack gives no named kind for, such as a C `#define` or `typedef`, was stored with a kind like `{"other":"constant"}`, so `--kind constant` missed it. It is now stored as its kind.
+
 ### Added
 
 - `find` and `show` look in the installed dependencies when the repository has no match, and `--deps` searches them every time. Each hit is labelled with its package and version, such as `vendor: robmorgan/phinx@0.16.1`. `grep` searches the dependencies' text only with `--deps`. The installed versions come from `composer.lock`, `package-lock.json`, `uv.lock` and `poetry.lock`. Only direct dependencies are searched unless `--all-deps` is given. Their symbols are indexed once for each package version, in an index every repository shares. A lockfile with packages that aren't installed gets a one-line note.
@@ -20,6 +24,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- `--kind` accepts only the kinds the index holds, so a misspelt kind is an error and not an empty result.
 - A big batch of files is parsed on every core, so the first index of a large repository is several times faster.
 - `grep` no longer prints a traceback when its reader, such as `head`, stops reading.
 - `grep` starts with the number of hits and files, such as `12 hits in 5 files, 4 shown`, so output cut by `head` or `--limit` says how much is missing.
