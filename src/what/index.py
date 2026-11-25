@@ -10,14 +10,16 @@ import os
 import stat as stat_modes
 import subprocess
 import sys
+import time
 from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 
 from what import directory, git, models
 from what.config import settings
 from what.models import IndexSession
-from what.symbols import extract
+from what.symbols import Symbol, extract_many
 
 
 class Index:
@@ -136,7 +138,8 @@ class Index:
         if current is None:
             return [], 0
 
-        branches = git.other_branches(self.root)
+        oldest = time.time() - settings.BRANCH_MAX_AGE_DAYS * 86400
+        branches = [branch for branch in git.other_branches(self.root) if branch.is_default or branch.date >= oldest]
         default = next((branch.tip for branch in branches if branch.is_default), None)
 
         with self.connect() as session, self._lock("branches") as locked:
@@ -147,10 +150,14 @@ class Index:
             if not locked or (most is not None and len(stale) > most):
                 return branches, len(stale)
 
-            for branch in stale:
+            def changed_files(branch: git.Branch) -> dict[str, str]:
                 base = current if branch.is_default else git.merge_base(self.root, default or current, branch.tip)
-                changed = git.changed_files(self.root, base, branch.tip) if base else {}
-                self._index_branch(session, branch, _base_key(branch, current), sorted(changed.items()))
+                return git.changed_files(self.root, base, branch.tip) if base else {}
+
+            # Each branch needs two git commands, and they spend most of their time waiting on the disk.
+            with ThreadPoolExecutor(settings.GIT_THREADS) as threads:
+                for branch, changed in zip(stale, threads.map(changed_files, stale)):
+                    self._index_branch(session, branch, _base_key(branch, current), sorted(changed.items()))
 
             gone = [name for name in known if name not in {branch.name for branch in branches}]
             if gone:
@@ -235,8 +242,9 @@ class Index:
             read.append((path, oid or git.blob_id(content), stat, text))
 
         with session.write_transaction():
+            parsed = _parse_new(session, [(path, oid, text) for path, oid, _, text in read])
             for path, oid, stat, text in read:
-                session.save_file(path, _add_blob(session, oid, path, text), stat)
+                session.save_file(path, _add_blob(session, oid, path, text, parsed), stat)
 
     def _index_deletions(self, session: IndexSession, batch: list[git.Deletion]) -> None:
         # The transaction starts before the check for known blobs, so another process can't delete one in between.
@@ -262,29 +270,41 @@ class Index:
         for start in range(0, len(files), settings.BATCH_SIZE):
             batch = files[start : start + settings.BATCH_SIZE]
             with session.write_transaction():
-                blobs = self._add_git_blobs(session, batch)
+                # A branch's text isn't indexed. It would make the index several times bigger, and a text search on
+                # branches reads the few files it needs from git.
+                blobs = self._add_git_blobs(session, batch, index_text=False)
                 session.save_branch_files(branch.name, [(path, blob) for (path, _), blob in zip(batch, blobs)])
 
         with session.write_transaction():
             session.save_branch(branch.name, branch.tip, head, branch.date)
 
-    def _add_git_blobs(self, session: IndexSession, files: list[tuple[str, str]]) -> list[int]:
+    def _add_git_blobs(
+        self,
+        session: IndexSession,
+        files: list[tuple[str, str]],
+        index_text: bool = True,
+    ) -> list[int]:
         """
         Index file contents that git holds, given as (path, blob id), and return their blob rows in the same order.
-        Only the contents the index hasn't seen are read. Call this inside a write transaction.
+        Only the contents the index hasn't seen, or holds without the text it now needs, are read. When index_text
+        is False, the symbols are indexed and the text is left out. Call this inside a write transaction.
         """
-        unread = [
-            oid for path, oid in files if _has_indexed_text(path) and session.blob_row(oid, _parsed_as(path)) is None
-        ]
+        unread: list[str] = []
+        for path, oid in files:
+            if not _has_indexed_text(path):
+                continue
+            known = session.blob_row(oid, _parsed_as(path))
+            if known is None or (index_text and session.lacks_text(known)):
+                unread.append(oid)
 
         sizes = git.blob_sizes(self.root, unread)
         small = [oid for oid in dict.fromkeys(unread) if sizes.get(oid, settings.MAX_BYTES + 1) <= settings.MAX_BYTES]
 
         texts = {oid: _as_text(content) for oid, content in git.read_blobs(self.root, small) if content is not None}
+        contents = [(path, oid, texts.get(oid) if _has_indexed_text(path) else None) for path, oid in files]
+        parsed = _parse_new(session, contents)
 
-        return [
-            _add_blob(session, oid, path, texts.get(oid) if _has_indexed_text(path) else None) for path, oid in files
-        ]
+        return [_add_blob(session, oid, path, text, parsed, index_text) for path, oid, text in contents]
 
     def _is_locked(self, name: str) -> bool:
         """True when another process holds one of the locks that _lock takes."""
@@ -315,14 +335,44 @@ def _base_key(branch: git.Branch, head: str) -> str:
     return head if branch.is_default else ""
 
 
-def _add_blob(session: IndexSession, oid: str, path: str, text: str | None) -> int:
-    """Return the row id of a file content, indexing its text and symbols when the index hasn't seen it."""
+def _parse_new(
+    session: IndexSession,
+    contents: list[tuple[str, str, str | None]],
+) -> dict[tuple[str, str], list[Symbol]]:
+    """
+    The symbols of each content, given as (path, blob id, text), that the index hasn't seen, by (blob id, parsed_as).
+    They are parsed together, so a big batch uses every core.
+    """
+    new: dict[tuple[str, str], tuple[str, str]] = {}
+    for path, oid, text in contents:
+        key = (oid, _parsed_as(path))
+        if text is not None and key not in new and session.blob_row(*key) is None:
+            new[key] = (path, text)
+
+    return dict(zip(new, extract_many(list(new.values()))))
+
+
+def _add_blob(
+    session: IndexSession,
+    oid: str,
+    path: str,
+    text: str | None,
+    parsed: dict[tuple[str, str], list[Symbol]],
+    index_text: bool = True,
+) -> int:
+    """
+    Return the row id of a file content, indexing it when the index hasn't  seen it. parsed holds the symbols
+    _parse_new found. A content stored without its text gets the text when index_text asks for it.
+    """
     parsed_as = _parsed_as(path)
     known = session.blob_row(oid, parsed_as)
     if known is not None:
+        if index_text and text is not None and session.lacks_text(known):
+            session.add_text(known, text)
         return known
 
-    return session.insert_blob(oid, parsed_as, text, extract(path, text) if text is not None else [])
+    symbols = parsed.get((oid, parsed_as), []) if text is not None else []
+    return session.insert_blob(oid, parsed_as, text, symbols, index_text)
 
 
 def _parsed_as(path: str) -> str:

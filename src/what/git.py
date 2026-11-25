@@ -4,6 +4,7 @@ import hashlib
 import os
 import subprocess
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -267,24 +268,46 @@ def blob_sizes(root: Path, oids: list[str]) -> dict[str, int]:
 
 
 def read_blobs(root: Path, oids: list[str]) -> Iterator[tuple[str, bytes | None]]:
-    """Yield each blob's content in the order asked for, or None when git no longer has it."""
-    for start in range(0, len(oids), settings.BLOBS_PER_CALL):
-        chunk = oids[start : start + settings.BLOBS_PER_CALL]
-        output = run(root, "cat-file", "--batch", stdin="\n".join(chunk).encode() + b"\n")
-        position = 0
+    """
+    Yield each blob's content in the order asked for, or None when git no longer has it. Several `git cat-file`
+    commands run at once, each on settings.BLOBS_PER_CALL blobs, because one at a time they mostly wait on the disk.
+    Only settings.GIT_THREADS outputs are held in memory at once.
+    """
+    chunks = [oids[start : start + settings.BLOBS_PER_CALL] for start in range(0, len(oids), settings.BLOBS_PER_CALL)]
+    if len(chunks) == 1:
+        yield from _blobs_in(chunks[0], _cat_file(root, chunks[0]))
+        return
 
-        for oid in chunk:
-            header_end = output.index(b"\n", position)
-            header = output[position:header_end].split(b" ")
-            position = header_end + 1
+    def read(chunk: list[str]) -> bytes:
+        return _cat_file(root, chunk)
 
-            if header[-1] == b"missing":
-                yield oid, None
-                continue
+    with ThreadPoolExecutor(settings.GIT_THREADS) as threads:
+        for start in range(0, len(chunks), settings.GIT_THREADS):
+            window = chunks[start : start + settings.GIT_THREADS]
+            for chunk, output in zip(window, threads.map(read, window)):
+                yield from _blobs_in(chunk, output)
 
-            size = int(header[2])
-            yield oid, output[position : position + size]
-            position += size + 1
+
+def _cat_file(root: Path, oids: list[str]) -> bytes:
+    return run(root, "cat-file", "--batch", stdin="\n".join(oids).encode() + b"\n")
+
+
+def _blobs_in(oids: list[str], output: bytes) -> Iterator[tuple[str, bytes | None]]:
+    """Each blob in the output of `git cat-file --batch`, which gives "<oid> blob <size>" and the content for each."""
+    position = 0
+
+    for oid in oids:
+        header_end = output.index(b"\n", position)
+        header = output[position:header_end].split(b" ")
+        position = header_end + 1
+
+        if header[-1] == b"missing":
+            yield oid, None
+            continue
+
+        size = int(header[2])
+        yield oid, output[position : position + size]
+        position += size + 1
 
 
 def commits_changing_text(root: Path, text: str, limit: int, timeout: float) -> list[str] | None:

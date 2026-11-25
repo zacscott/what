@@ -88,3 +88,15 @@ def test_callers_of_a_python_function(index: Index, repo: Path) -> None:
         "src/ripe.py-5-def daily():",
         "src/ripe.py:7:ripen()",
     ]
+
+
+def test_callers_keeps_a_string_only_when_it_names_the_callable(index: Index, repo: Path) -> None:
+    write_callers(repo)
+    (repo / "src/Queue.php").write_text(
+        "<?php\nfunction queue() {\n    $name = 'fruit-ripen-queue';\n    call_user_func('Ripener::ripen', 1);\n}\n"
+    )
+
+    output = search.callers(index, "Ripener.ripen")
+
+    assert "fruit-ripen-queue" not in output
+    assert "src/Queue.php:4:call_user_func('Ripener::ripen', 1);" + search.POSSIBLE_MARK in output

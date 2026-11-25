@@ -380,8 +380,8 @@ def _grep_on_branches(
 
     matcher, literals = _matcher(pattern, regex)
     with index.connect() as session:
-        places = [place for place in session.branch_places_with_text(literals) if path_matches(place.path, path)]
-        found = _matching_lines(session, _git_texts(index, places), matcher, limit, len(places))
+        places = _small_enough(index, [place for place in session.branch_places() if path_matches(place.path, path)])
+        found = _matching_lines(session, _branch_texts(index, places, literals), matcher, limit, len(places))
 
     if not found.lines:
         return [], notes
@@ -486,6 +486,30 @@ def _file_texts(index: Index, places: list[Place]) -> Iterator[tuple[Place, str 
     return ((place, index.read_text(Path(place.package_folder or "") / place.path)) for place in places)
 
 
+def _branch_texts(
+    index: Index,
+    places: list[Place],
+    literals: list[str],
+) -> Iterator[tuple[Place, str | None]]:
+    """
+    The text of files on other branches, read from git in order. Their text isn't indexed, so every file is read.
+    A file without the pattern's plain text is passed over before it is decoded, which is most of the cost.
+    """
+    required = [literal.lower().encode() for literal in literals]
+
+    for place, (_, content) in zip(places, git.read_blobs(index.root, [place.oid for place in places])):
+        if content is None or not all(literal in content.lower() for literal in required):
+            yield place, None
+        else:
+            yield place, content.decode("utf-8", "replace")
+
+
+def _small_enough(index: Index, places: list[Place]) -> list[Place]:
+    """The places whose content is no bigger than settings.MAX_BYTES, which a text search reads."""
+    sizes = git.blob_sizes(index.root, [place.oid for place in places])
+    return [place for place in places if sizes.get(place.oid, settings.MAX_BYTES + 1) <= settings.MAX_BYTES]
+
+
 def _git_texts(index: Index, places: list[Place]) -> Iterator[tuple[Place, str | None]]:
     """The text of files that git holds, read in order. Only the first settings.GIT_FILES_READ are read."""
     blobs = git.read_blobs(index.root, [place.oid for place in places[: settings.GIT_FILES_READ]])
@@ -573,16 +597,18 @@ def _calls_in(
     """
     lines = split_lines(text)
     matches = [
-        (number, match.start())
+        (number, match.start(), match.end())
         for number, line in enumerate(lines, 1)
         if (path, number) not in definitions
         for match in matcher.finditer(line)
     ]
-    roles = text_roles(path, text, [(number, column + 1) for number, column in matches])
+    roles = text_roles(path, text, [(number, column + 1) for number, column, _ in matches])
 
     best: dict[int, bool] = {}
-    for (number, column), role in zip(matches, roles):
+    for (number, column, end), role in zip(matches, roles):
         if role == "comment":
+            continue
+        if role == "string" and not _names_a_callable(lines[number - 1], column, end):
             continue
 
         enclosing = _innermost([symbol for symbol in symbols if symbol.kind in TYPE_KINDS], number)
@@ -591,6 +617,19 @@ def _calls_in(
             best[number] = best.get(number, False) or (certainty and role == "code")
 
     return [(number, lines[number - 1], certain) for number, certain in sorted(best.items())]
+
+
+# A string that names a callable ends at the name, and has nothing before the name but a class and "::", ".",
+# "@" or "->", as in 'Deepgram::transcribe', 'transcribe' or [$this, 'transcribe'].
+CALLABLE_STRING = re.compile(r"""["'][\w\\]*(::|\.|@|->)?$""")
+
+
+def _names_a_callable(line: str, start: int, end: int) -> bool:
+    """
+    True when the match from start to end, inside a string, is a callable's name, such as 'Deepgram::transcribe',
+    and not a word in text, such as 'ai-scribe-transcribe-chunk'.
+    """
+    return bool(CALLABLE_STRING.search(line[:start])) and line[end : end + 1] in ("'", '"')
 
 
 def _call_certainty(

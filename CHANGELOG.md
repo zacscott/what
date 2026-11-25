@@ -12,7 +12,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - `what callers <symbol>` lists the lines that call or reference a symbol, each under the function it sits in. It leaves out the definitions and mentions in comments and docblocks. A call that may be to another symbol, such as a method called on an untyped variable, ends with `[possible]`.
 
-- `find` and `grep` search other branches when the working tree has no match, and `--branches` searches them every time. They search the default branch and every local and remote-tracking branch that isn't merged into it. A hit is shown only where the branch's version of the file differs from the working tree, and is labelled with the branch and the age of its last commit. When remote-tracking branches were searched, the output says when they were last fetched.
+- `find` and `grep` search other branches when the working tree has no match, and `--branches` searches them every time. They search the default branch and every local and remote-tracking branch that isn't merged into it and has a commit in the last year. Branch files have their symbols indexed but not their text. A hit is shown only where the branch's version of the file differs from the working tree, and is labelled with the branch and the age of its last commit. When remote-tracking branches were searched, the output says when they were last fetched.
 
 - `--ref <ref>` on `find`, `show` and `outline` answers at a branch, tag or commit in place of the working tree. It reads the files from git and needs no index of the ref. An unknown ref exits with an error that names it.
 
@@ -20,6 +20,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- A big batch of files is parsed on every core, so the first index of a large repository is several times faster.
+- `grep` no longer prints a traceback when its reader, such as `head`, stops reading.
 - `grep` starts with the number of hits and files, such as `12 hits in 5 files, 4 shown`, so output cut by `head` or `--limit` says how much is missing.
 - `grep` marks the line that defines a matching symbol with `[definition]`.
 - The notice that the index of deleted files is not up to date appears only on `grep --deleted`.

@@ -21,7 +21,7 @@ from what import models
 from what.config import settings
 from what.index import Index
 from what.models import Place, SymbolHit
-from what.symbols import extract
+from what.symbols import extract_many
 
 
 class DependencyReach(enum.Enum):
@@ -106,7 +106,7 @@ def installed(index: Index, transitive: bool) -> Installed:
             if not path.is_file():
                 continue
 
-            found, missing = read(path.parent, lockfile)
+            found, missing, stale = read(path.parent, lockfile)
             packages.extend(package for package in found if transitive or package.direct)
 
             if lockfile == "package-lock.json" and "packages" not in _json(path):
@@ -114,11 +114,22 @@ def installed(index: Index, transitive: bool) -> Installed:
 
             missing = [name for name, direct in missing if transitive or direct]
             if missing:
-                count = "1 package" if len(missing) == 1 else f"{len(missing)} packages"
                 verb = "isn't" if len(missing) == 1 else "aren't"
-                notes.append(f"{count} in {folder}{lockfile} {verb} installed; run {command}")
+                notes.append(f"{_packages(len(missing))} in {folder}{lockfile} {verb} installed; run {command}")
+
+            stale = [name for name, direct in stale if transitive or direct]
+            if stale:
+                verb = "is" if len(stale) == 1 else "are"
+                notes.append(
+                    f"{_packages(len(stale))} in {folder}{lockfile} {verb} installed at another version, which is "
+                    f"what's searched; run {command}"
+                )
 
     return Installed(packages, notes)
+
+
+def _packages(count: int) -> str:
+    return "1 package" if count == 1 else f"{count} packages"
 
 
 def project_folders(index: Index) -> list[str]:
@@ -166,7 +177,8 @@ def package_rows(index: Index, packages: list[Package]) -> dict[int, Package]:
         for package in packages:
             row = session.package_row(package.ecosystem, package.name, package.cache_version)
             if row is None:
-                files = {path: extract(path, text) for path, text in _source_files(index, package)}
+                sources = list(_source_files(index, package))
+                files = dict(zip([path for path, _ in sources], extract_many(sources)))
                 with session.write_transaction():
                     # Another process may have indexed the package while this one read it.
                     row = session.package_row(package.ecosystem, package.name, package.cache_version)
@@ -246,10 +258,10 @@ def _walk(folder: Path) -> list[str]:
     return sorted(found)
 
 
-def _composer(root: Path, lockfile: str) -> tuple[list[Package], list[tuple[str, bool]]]:
+def _composer(root: Path, lockfile: str) -> "LockfileRead":
     """
-    The packages in composer.lock that are installed in vendor/, and the (name, direct) of those that aren't. The
-    direct dependencies are the ones composer.json requires.
+    The packages in composer.lock that are installed in vendor/, and the (name, direct) of those that aren't and of
+    those installed at another version. The direct dependencies are the ones composer.json requires.
     """
     lock = _json(root / lockfile)
     manifest = _json(root / "composer.json")
@@ -262,6 +274,7 @@ def _composer(root: Path, lockfile: str) -> tuple[list[Package], list[tuple[str,
 
     found: list[Package] = []
     missing: list[tuple[str, bool]] = []
+    stale: list[tuple[str, bool]] = []
     for entry in [*lock.get("packages", []), *lock.get("packages-dev", [])]:
         name, version = entry["name"], entry["version"]
         if entry.get("type") == "metapackage" or entry.get("dist", {}).get("type") == "path":
@@ -276,20 +289,25 @@ def _composer(root: Path, lockfile: str) -> tuple[list[Package], list[tuple[str,
             if "install-path" in install
             else root / "vendor" / name
         )
-        if install.get("version") != version or not folder.is_dir():
+        if "version" not in install or not folder.is_dir():
             missing.append((name, name in direct))
             continue
+        if install["version"] != version:
+            stale.append((name, name in direct))
 
-        pin = entry.get("source", {}).get("reference") or entry.get("dist", {}).get("reference") or ""
-        found.append(Package("composer", name, version, pin, "vendor", folder.resolve(), None, name in direct))
+        # The installed package is what's on disk, so its version and commit are what the index is keyed on.
+        source = cast(dict[str, Any], install)
+        pin = source.get("source", {}).get("reference") or source.get("dist", {}).get("reference") or ""
+        package = Package("composer", name, install["version"], pin, "vendor", folder.resolve(), None, name in direct)
+        found.append(package)
 
-    return found, missing
+    return found, missing, stale
 
 
-def _npm(root: Path, lockfile: str) -> tuple[list[Package], list[tuple[str, bool]]]:
+def _npm(root: Path, lockfile: str) -> "LockfileRead":
     """
     The packages in package-lock.json that are installed in node_modules, and the (name, direct) of those that
-    aren't. Each key of "packages" is the folder the package is installed in, so nested installs are found too.
+    aren't and of those installed at another version. Each key of "packages" is the folder the package is installed in, so nested installs are found too.
     """
     lock = _json(root / lockfile)
     packages: dict[str, Any] = lock.get("packages", {})
@@ -298,6 +316,7 @@ def _npm(root: Path, lockfile: str) -> tuple[list[Package], list[tuple[str, bool
 
     found: list[Package] = []
     missing: list[tuple[str, bool]] = []
+    stale: list[tuple[str, bool]] = []
     for key, entry in packages.items():
         if not key.startswith("node_modules/") or entry.get("link") or "version" not in entry:
             continue
@@ -305,22 +324,26 @@ def _npm(root: Path, lockfile: str) -> tuple[list[Package], list[tuple[str, bool
         name = key.rsplit("node_modules/", 1)[-1]
         is_direct = key == f"node_modules/{name}" and name in direct
         folder = root / key
-        if _json(folder / "package.json").get("version") != entry["version"]:
+        version = _json(folder / "package.json").get("version")
+        if version is None:
             # An optional package is often for another platform, such as fsevents on Linux, so its absence is normal.
             if not entry.get("optional"):
                 missing.append((name, is_direct))
             continue
 
-        pin = entry.get("integrity") or entry.get("resolved") or ""
-        found.append(Package("npm", name, entry["version"], pin, "node_modules", folder, None, is_direct))
+        # The lockfile's integrity hash pins the content only when the installed version is the locked one.
+        pin = entry.get("integrity") or entry.get("resolved") or "" if version == entry["version"] else ""
+        if version != entry["version"]:
+            stale.append((name, is_direct))
+        found.append(Package("npm", name, version, pin, "node_modules", folder, None, is_direct))
 
-    return found, missing
+    return found, missing, stale
 
 
-def _python(root: Path, lockfile: str) -> tuple[list[Package], list[tuple[str, bool]]]:
+def _python(root: Path, lockfile: str) -> "LockfileRead":
     """
     The packages in uv.lock or poetry.lock that are installed in the virtualenv, and the (name, direct) of those
-    that arent. The direct dependencies are the ones pyproject.toml names. The files of each package come from the
+    that aren't and of those installed at another version. The direct dependencies are the ones pyproject.toml names. The files of each package come froom the
     RECORD file pip and uv write, since a distribution's name is often not the name of its folder.
     """
     with open(root / lockfile, "rb") as file:
@@ -329,35 +352,43 @@ def _python(root: Path, lockfile: str) -> tuple[list[Package], list[tuple[str, b
     site = _site_packages(root)
     installs = _distributions(site) if site is not None else {}
 
-    entries = lock.get("package", [])
-    # uv.lock can list several versions of one package, one for each platform, and only one gets installed.
-    installed_names = {
-        _normal_name(entry["name"])
-        for entry in entries
-        if (_normal_name(entry["name"]), entry.get("version")) in installs
-    }
-
     found: list[Package] = []
     missing: list[tuple[str, bool]] = []
-    for entry in entries:
+    stale: list[tuple[str, bool]] = []
+    # uv.lock can list several versions of one package, one for each platform, and only one gets installed.
+    seen: set[str] = set()
+
+    for entry in lock.get("package", []):
         name, version = entry["name"], entry.get("version")
         source = entry.get("source", {})
         if version is None or {"editable", "virtual", "path", "directory"} & set(source):
             # The project itself, or local code that can change under one version.
             continue
+        if _normal_name(name) in seen:
+            continue
+        seen.add(_normal_name(name))
 
         is_direct = _normal_name(name) in direct
-        record = installs.get((_normal_name(name), version))
-        if site is None or record is None:
-            if _normal_name(name) not in installed_names:
-                missing.append((name, is_direct))
+        install = installs.get(_normal_name(name))
+        if site is None or install is None:
+            missing.append((name, is_direct))
             continue
 
-        # A package from git can change under one version, so its commit is part of the key.
-        pin = source.get("git", "")
-        found.append(Package("python", name, version, pin, "site-packages", site, _record_files(record), is_direct))
+        installed_version, record = install
+        if installed_version != version:
+            stale.append((name, is_direct))
 
-    return found, missing
+        # A package from git can change under one version, so its commit is part of the key.
+        pin = source.get("git", "") if installed_version == version else ""
+        files = _record_files(record)
+        found.append(Package("python", name, installed_version, pin, "site-packages", site, files, is_direct))
+
+    return found, missing, stale
+
+
+# What reading one lockfile gives: the installed packages, and the (name, direct) of the packages that aren't
+# installed and of those installed at another version than the lockfile records.
+LockfileRead = tuple[list[Package], list[tuple[str, bool]], list[tuple[str, bool]]]
 
 
 def _python_direct(pyproject: Path) -> set[str]:
@@ -397,13 +428,13 @@ def _site_packages(root: Path) -> Path | None:
     return None
 
 
-def _distributions(site: Path) -> dict[tuple[str, str], Path]:
-    """The RECORD filke of every installed distribution, by (normalised name, version)."""
-    found: dict[tuple[str, str], Path] = {}
+def _distributions(site: Path) -> dict[str, tuple[str, Path]]:
+    """The version and RECORD file of every installed distribution, by normalised name."""
+    found: dict[str, tuple[str, Path]] = {}
 
     for info in site.glob("*.dist-info"):
         name, _, version = info.name.removesuffix(".dist-info").partition("-")
-        found[(_normal_name(name), version)] = info / "RECORD"
+        found[_normal_name(name)] = (version, info / "RECORD")
 
     return found
 

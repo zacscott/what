@@ -90,6 +90,9 @@ def main() -> None:
         app(prog_name="what")
     except (directory.TooManyFiles, git.UnknownRef) as error:
         sys.exit(f"what: {error}")
+    except BrokenPipeError:
+        # The reader, such as head, stopped reading. Python would print a traceback as it flushes at exit.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
 
 
 @app.command(hidden=True)

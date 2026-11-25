@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from functools import cache
 from typing import TYPE_CHECKING
 
 from what.config import settings
@@ -152,6 +155,30 @@ def _is_lone_string(node: Node) -> bool:
         outer = outer.parent
 
     return outer.parent is not None and outer.parent.type in {"expression_statement", "block", "module"}
+
+
+def extract_many(files: list[tuple[str, str]]) -> list[list[Symbol]]:
+    """
+    The definitions in each file, given as (path, text), in the same order. A batch of settings.PARALLEL_FILES or
+    more is parsed in other processes, one for each core, since tree-sitter uses one core per parse.
+    """
+    if len(files) < settings.PARALLEL_FILES:
+        return [extract(path, text) for path, text in files]
+
+    return list(_workers().map(_extract_file, files, chunksize=8))
+
+
+def _extract_file(file: tuple[str, str]) -> list[Symbol]:
+    return extract(*file)
+
+
+@cache
+def _workers() -> ProcessPoolExecutor:
+    """
+    The processes that parse files, started once and kept for the rest of the run. They are started fresh, not
+    forked, because forking a process that has open database connections and threads isn't safe.
+    """
+    return ProcessPoolExecutor(mp_context=multiprocessing.get_context("spawn"))
 
 
 def _add_structure(

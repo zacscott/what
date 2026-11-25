@@ -21,16 +21,19 @@ from pathlib import Path
 from what.symbols import Symbol
 
 # Changing the tables means raising this. An index with another version is rebuilt from nothing.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # How many rows one tier of a symbol search fetches before ranking.
 TIER_FETCH = 300
 
 SCHEMA = """
+-- text_missing is 1 for a content whose symbols are indexed but whose text was left out of text_fts, as for a
+-- file on another branch. Its text is added when the content turns up in the working tree or a deleted file.
 CREATE TABLE blobs (
     id INTEGER PRIMARY KEY,
     oid TEXT NOT NULL,
     parsed_as TEXT NOT NULL,
+    text_missing INTEGER NOT NULL DEFAULT 0,
     UNIQUE (oid, parsed_as)
 );
 CREATE TABLE symbols (
@@ -273,28 +276,20 @@ class IndexSession(_Session):
         """
         return self._places_with_text(literals, "deleted")
 
-    def branch_places_with_text(self, literals: list[str]) -> list[Place]:
+    def branch_places(self) -> list[Place]:
         """
-        Files on other branches whose text contains every literal, best match first. A content that several branches
-        hold is listed once, for the branch with the newest commit. With no literals, every branch file is a candidate.
+        Files on otehr branches whose text is indexable and that differ from the working tree, newest branch first. A content that
+        several branches hold is listed once, for the branch with the newest commit. Their text isn't indexed, so a
+        text search reads each obe from git.
         """
-        not_live = "NOT EXISTS (SELECT 1 FROM files f WHERE f.path = t.path AND f.blob = t.blob)"
-        columns = "t.path, b.oid, b.id, t.branch, br.date"
-        joins = "JOIN blobs b ON b.id = t.blob JOIN branches br ON br.name = t.branch"
-
-        if not literals:
-            sql = f"SELECT {columns} FROM branch_files t {joins} WHERE {not_live} ORDER BY t.path, br.date DESC"
-            rows = self._db.execute(sql)
-        else:
-            match = " AND ".join('"' + literal.replace('"', '""') + '"' for literal in literals)
-            sql = f"""
-                SELECT {columns} FROM text_fts JOIN branch_files t ON t.blob = text_fts.rowid {joins}
-                WHERE text_fts MATCH ? AND {not_live}
-                ORDER BY bm25(text_fts), t.path, br.date DESC
-            """
-            rows = self._db.execute(sql, (match,))
-
-        return _branch_places(rows)
+        sql = """
+            SELECT t.path, b.oid, b.id, t.branch, br.date
+            FROM branch_files t JOIN blobs b ON b.id = t.blob JOIN branches br ON br.name = t.branch
+            WHERE b.parsed_as != ''
+            AND NOT EXISTS (SELECT 1 FROM files f WHERE f.path = t.path AND f.blob = t.blob)
+            ORDER BY br.date DESC, t.path
+        """
+        return _branch_places(self._db.execute(sql))
 
     def symbols_named(
         self,
@@ -378,13 +373,19 @@ class IndexSession(_Session):
         parsed_as: str,
         text: str | None,
         symbols: list[Symbol],
+        index_text: bool = True,
     ) -> int:
-        """Store a new content and return its row id. When text is None, only the row is stored."""
-        insert = "INSERT INTO blobs (oid, parsed_as) VALUES (?, ?) RETURNING id"
-        blob: int = self._db.execute(insert, (oid, parsed_as)).fetchone()[0]
+        """
+        Store a new content and return its row id. When text is None, only the row is stored. When index_text is
+        False, the symbols are stored but the text is left out of the text index.
+        """
+        insert = "INSERT INTO blobs (oid, parsed_as, text_missing) VALUES (?, ?, ?) RETURNING id"
+        text_missing = text is not None and not index_text
+        blob: int = self._db.execute(insert, (oid, parsed_as, text_missing)).fetchone()[0]
 
         if text is not None:
-            self._db.execute("INSERT INTO text_fts (rowid, body) VALUES (?, ?)", (blob, text))
+            if index_text:
+                self._db.execute("INSERT INTO text_fts (rowid, body) VALUES (?, ?)", (blob, text))
             self._db.executemany(
                 "INSERT INTO symbols (blob, name, kind, parent, line, end_line, signature) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 [(blob, s.name, s.kind, s.parent, s.line, s.end_line, s.signature) for s in symbols],
@@ -394,6 +395,15 @@ class IndexSession(_Session):
             )
 
         return blob
+
+    def lacks_text(self, blob: int) -> bool:
+        """True when a content's symbols are indexed but its text was left out of the text index."""
+        return bool(self._db.execute("SELECT text_missing FROM blobs WHERE id = ?", (blob,)).fetchone()[0])
+
+    def add_text(self, blob: int, text: str) -> None:
+        """Add the text of a content that was stored without it."""
+        self._db.execute("INSERT INTO text_fts (rowid, body) VALUES (?, ?)", (blob, text))
+        self._db.execute("UPDATE blobs SET text_missing = 0 WHERE id = ?", (blob,))
 
     def insert_symbol_name(self, value: str) -> None:
         """

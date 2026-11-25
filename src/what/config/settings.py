@@ -17,6 +17,17 @@ SHOW_MAX_LINES = 400
 # leaves out. A pattern with no plain text makes every file a candidate.
 COUNT_FILES = 2000
 
+# Branches whose last commit is older than this many days are left out. They are rarely the answer, and a large
+# repository has hundreds of them. The default branch is always searched.
+BRANCH_MAX_AGE_DAYS = 365
+
+# How many files one batch must hold before they are parsed in other processes, one for each core. Starting the
+# processes costs about a second, so a small batch is parsed in this one.
+PARALLEL_FILES = 50
+
+# How many git commands run at once while the files of branches are listed.
+GIT_THREADS = 8
+
 # How many moved branches a search reads itself. When mroe have moved, a process in the background reads them, and
 # the search says some branches may be missing.
 BRANCHES_READ_INLINE = 20

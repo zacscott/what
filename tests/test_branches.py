@@ -1,5 +1,6 @@
 """Searches that reach the other branches of the repository, as well as the working tree."""
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -198,3 +199,59 @@ def test_moving_head_reads_only_the_default_branch_again(
     index.refresh_branches()
 
     assert read == [git_module.commit_of(repo, "main")]
+
+
+def test_a_branch_with_no_commit_for_over_a_year_is_left_out(index: Index, repo: Path) -> None:
+    git(repo, "checkout", "-q", "-b", "feature/ancient")
+    (repo / "src/ancient.py").write_text("def ancient_banana():\n    pass\n")
+    git(repo, "add", "src/ancient.py")
+    old = "2020-01-01T00:00:00"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "Ancient",
+        ],
+        check=True,
+        env={**os.environ, "GIT_COMMITTER_DATE": old, "GIT_AUTHOR_DATE": old},
+    )
+    git(repo, "checkout", "-q", "main")
+
+    assert "feature/ancient" not in search.find(index, "ancient_banana")
+
+
+def test_a_branch_file_that_turns_up_in_the_working_tree_gets_its_text_indexed(index: Index, repo: Path) -> None:
+    git(repo, "checkout", "-q", "-b", "feature/peel")
+    commit_file(repo, "src/peel.py", "def peel_banana():\n    return 'peeled'\n", "Peel")
+    git(repo, "checkout", "-q", "main")
+    assert "feature/peel" in search.grep(index, "peeled")
+
+    (repo / "src/peel.py").write_text("def peel_banana():\n    return 'peeled'\n")
+
+    assert search.grep(index, "peeled").splitlines()[:3] == [
+        "1 hit in 1 file",
+        "src/peel.py-1-def peel_banana():",
+        "src/peel.py:2:return 'peeled'",
+    ]
+
+
+def test_a_big_batch_is_parsed_in_other_processes(
+    index: Index,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "PARALLEL_FILES", 2)
+    for number in range(4):
+        (repo / f"src/many{number}.py").write_text(f"def many_banana_{number}():\n    pass\n")
+
+    assert search.find(index, "many_banana_3").splitlines() == ["src/many3.py:1:def many_banana_3():"]

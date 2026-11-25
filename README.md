@@ -28,7 +28,7 @@ what --prompt >> CLAUDE.md
 what --prompt >> AGENTS.md
 ```
 
-The block is about 800 characters. It tells the harness to use `what` before grep, glob or reading a whole file.
+The block is about 1,600 characters. It tells the harness to use `what` before grep, glob or reading a whole file.
 
 Include it in every repository by adding the block to your global file instead, such as `~/.claude/CLAUDE.md`.
 
@@ -58,10 +58,10 @@ The first search builds the index. `what --index` builds it up front.
 
 ## How it works
 
-- Symbols come from tree-sitter. Every language the grammar pack supports gets parsed.
+- Symbols come from tree-sitter. Every language the grammar pack supports gets parsed, on every core when there are many files.
 - Text is in an SQLite FTS5 trigram index. The index picks the files that might match, then `what` reads only those files for the matching lines.
-- Other branches are searched when `find` or `grep` finds nothing in the working tree, or every time with `--branches`. The default branch and every branch not merged into it are searched, local and remote-tracking. A branch adds only the files it changed, and only where its version differs from the working tree. Each file version is indexed once, by its git blob id, so the index grows with the real changes and not with the number of branches. A search reads a few moved branches itself. When many have moved, as on the first search of a repository with a thousand branches, a process in the background reads them and the search says some branches may be missing.
-- Installed dependencies are searched when `find` or `show` finds nothing in the repository, or every time with `--deps`. `grep` leaves them out unless given `--deps`. The versions come from `composer.lock`, `package-lock.json`, `uv.lock` and `poetry.lock`, and only direct dependencies are searched unless `--all-deps` is given. Only their symbols are indexed, in `dependencies.db` beside the repository indexes, once for each package version that every repository shares.
+- Other branches are searched when `find` or `grep` finds nothing in the working tree, or every time with `--branches`. The default branch and every branch not merged into it are searched, local and remote-tracking, except branches with no commit for a year. A branch adds only the files it changed, and only where its version differs from the working tree. Each file version is indexed once, by its git blob id, so the index grows with the real changes and not with the number of branches. Only the symbols of branch files are indexed, not their text, so `grep` on branches reads those files from git. A search reads a few moved branches itself. When many have moved, as on the first search of a repository with a thousand branches, a process in the background reads them and the search says some branches may be missing.
+- Installed dependencies are searched when `find` or `show` finds nothing in the repository, or every time with `--deps`. `grep` leaves them out unless given `--deps`. The versions come from `composer.lock`, `package-lock.json`, `uv.lock` and `poetry.lock`, and only direct dependencies are searched unless `--all-deps` is given. A lockfile in a subfolder, such as `include/composer.lock`, is read too. The version searched is the one installed, with a note when it differs from the lockfile. Only their symbols are indexed, in `dependencies.db` beside the repository indexes, once for each package version that every repository shares.
 - Deleted files come from `git log --diff-filter=D`. Each one is indexed as it was just before the commit that removed it. They are named `COMMIT^:path`, so `git show` accepts the name.
 - Before each search, `what` asks git which files changed and re-reads only those. There is no file watcher.
 - Outside a git repository, `what` walks the directory and follows its `.gitignore` files. There are no deleted files.

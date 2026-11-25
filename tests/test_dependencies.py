@@ -193,17 +193,29 @@ def test_a_composer_package_installed_outside_vendor_is_found_where_installed_js
 
 def test_a_dev_branch_package_is_indexed_again_when_its_commit_changes(index: Index, repo: Path) -> None:
     install_composer(repo, {"robmorgan/phinx": "dev-main"}, ["robmorgan/phinx"])
-    lock = json.loads((repo / "composer.lock").read_text())
-    lock["packages"][0]["source"] = {"reference": "aaa111"}
-    (repo / "composer.lock").write_text(json.dumps(lock))
+    installed = repo / "vendor/composer/installed.json"
+    record = json.loads(installed.read_text())
+    record["packages"][0]["source"] = {"reference": "aaa111"}
+    installed.write_text(json.dumps(record))
     search.find(index, "addIndex")
 
-    lock["packages"][0]["source"] = {"reference": "bbb222"}
-    (repo / "composer.lock").write_text(json.dumps(lock))
+    record["packages"][0]["source"] = {"reference": "bbb222"}
+    installed.write_text(json.dumps(record))
     table = repo / "vendor/robmorgan/phinx/src/Phinx/Db/Table.php"
     table.write_text(table.read_text().replace("addIndex", "addKey"))
 
     assert search.find(index, "addKey").startswith("vendor: robmorgan/phinx@dev-main src/Phinx/Db/Table.php:5:")
+
+
+def test_a_package_installed_at_another_version_is_searched_with_a_note(index: Index, repo: Path) -> None:
+    install_composer(
+        repo, {"robmorgan/phinx": "0.16.12"}, ["robmorgan/phinx"], installed={"robmorgan/phinx": "0.16.11"}
+    )
+
+    assert search.find(index, "addIndex").splitlines() == [
+        "vendor: robmorgan/phinx@0.16.11 src/Phinx/Db/Table.php:5:public function addIndex($columns, array $options = [])",
+        "1 package in composer.lock is installed at another version, which is what's searched; run composer install",
+    ]
 
 
 def test_an_optional_npm_package_that_is_not_installed_gets_no_note(index: Index, repo: Path) -> None:
