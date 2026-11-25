@@ -30,6 +30,7 @@ examples:
   what grep "str_repeat("          text, each hit under the function it sits in
   what grep "bend\\w+" --regex --deleted
   what grep "punctuate" --branches  also search unmerged branches
+  what callers Banana.bend           the lines that call one method
   what show Banana.bend --ref origin/dev   the method as it is on another branch
 """
 
@@ -148,6 +149,15 @@ def grep(
         index, " ".join(pattern), regex, path, limit, deleted=deleted, commits=commits, branches=branches
     )
     print(found)
+
+
+@app.command()
+@click.argument("target")
+@click.option("--path", help=PATH_HELP)
+@click.option("--limit", default=40, show_default=True)
+def callers(target: str, path: str | None, limit: int) -> None:
+    """List the lines that call or reference a symbol ("Banana.bend"), each under the function it sits in."""
+    print(search.callers(_searchable_index(), target, path, limit))
 
 
 @app.command()

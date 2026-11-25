@@ -9,6 +9,7 @@ from what.config import settings
 
 if TYPE_CHECKING:
     import tree_sitter_language_pack as grammars
+    from tree_sitter import Node
 
 # Languages whose grammar could not be downloaded. We don't retry them for every file.
 _unavailable: set[str] = set()
@@ -91,6 +92,59 @@ def extract(path: str, text: str) -> list[Symbol]:
             )
 
     return sorted(found.values(), key=lambda symbol: (symbol.line, -symbol.end_line))
+
+
+def text_roles(path: str, text: str, positions: list[tuple[int, int]]) -> list[str]:
+    """
+    What each position in a file sits in: "comment", "string" or "code". A position is (line, column), both counted
+    from 1 and in characters. A string that is a statement on its own, suh as a Python docstring, counts as a comment.
+    Every position is "code" when the language can't be parsed.
+    """
+    import tree_sitter_language_pack as grammars
+
+    language = grammars.detect_language_from_path(path)
+    if language is None or language in settings.NO_SYMBOLS or language in _unavailable:
+        return ["code"] * len(positions)
+
+    try:
+        tree = grammars.get_parser(language).parse(text.encode())
+    except grammars.DownloadError:
+        _unavailable.add(language)
+        return ["code"] * len(positions)
+    except grammars.Error:
+        return ["code"] * len(positions)
+
+    lines = split_lines(text)
+    roles: list[str] = []
+
+    for line, column in positions:
+        # tree-sitter counts rows from 0 and columns in bytes.
+        start = (line - 1, len(lines[line - 1][: column - 1].encode()))
+        node = tree.root_node.descendant_for_point_range(start, start)
+        roles.append(_role(node))
+
+    return roles
+
+
+def _role(node: Node | None) -> str:
+    """Whether a syntax node is in a comment, in a string or in code, from the nodes around it."""
+    while node is not None:
+        if "comment" in node.type:
+            return "comment"
+        if "string" in node.type:
+            return "comment" if _is_lone_string(node) else "string"
+        node = node.parent
+
+    return "code"
+
+
+def _is_lone_string(node: Node) -> bool:
+    """True when the string is a statement of its own, which does nothing at runtime, like a docstring."""
+    outer = node
+    while outer.parent is not None and "string" in outer.parent.type:
+        outer = outer.parent
+
+    return outer.parent is not None and outer.parent.type in {"expression_statement", "block", "module"}
 
 
 def _add_structure(

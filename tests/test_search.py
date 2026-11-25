@@ -111,6 +111,11 @@ def test_grep_marks_the_line_that_defines_a_matching_symbol(index: Index, repo: 
     ]
 
 
+def test_grep_marks_a_definition_when_the_pattern_holds_more_than_the_name(index: Index) -> None:
+    assert search.grep(index, "function bandana").splitlines()[1].endswith(search.DEFINITION_MARK)
+    assert not search.grep(index, "int $count").splitlines()[1].endswith(search.DEFINITION_MARK)
+
+
 def test_grep_counts_the_hits_it_leaves_out(index: Index, repo: Path) -> None:
     for number in range(5):
         (repo / f"src/many{number}.txt").write_text("pip\npip\n")

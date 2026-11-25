@@ -109,7 +109,7 @@ def test_a_directory_that_is_too_big_is_refused(
 
 def test_prompt_names_every_search() -> None:
     printed = run("--prompt")
-    for usage in ["`what <name>`", "`what <file>`", "`what show ", "`what grep "]:
+    for usage in ["`what <name>`", "`what <file>`", "`what show ", "`what callers ", "`what grep "]:
         assert usage in printed
 
 

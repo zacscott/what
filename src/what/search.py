@@ -12,7 +12,7 @@ from what import git
 from what.config import settings
 from what.index import Index
 from what.models import IndexSession, Place, Scope, SymbolHit, age, path_matches
-from what.symbols import Symbol, extract, split_lines
+from what.symbols import Symbol, extract, split_lines, text_roles
 
 TYPE_KINDS = {"class", "interface", "trait", "enum", "struct", "type", "module", "namespace", "impl"}
 CALLABLE_KINDS = {"function", "method"}
@@ -31,6 +31,13 @@ HISTORY_BUILDING = "(The index of deleted files is not up to date, so deleted fi
 
 # Ends a grep hit on the line that definse the symbol, so the definition stands out from the call sites.
 DEFINITION_MARK = "  [definition]"
+
+# Ends a callers hit that may not call the symbol, such as a method called on a variable whose class isn't known.
+POSSIBLE_MARK = "  [possible]"
+
+# What comes before a name on its line when something holds it: the holder and the operator, such as "$this->",
+# "Deepgram::", "self." or a namespace like "App\".
+RECEIVER = re.compile(r"([\w$\\]*)\s*(::|\?->|->|\?\.|\.|\\)\s*$")
 
 
 def lookup(
@@ -389,6 +396,134 @@ def _git_texts(index: Index, places: list[Place]) -> Iterator[tuple[Place, str |
     return (
         (place, content.decode("utf-8", "replace") if content else None) for place, (_, content) in zip(places, blobs)
     )
+
+
+def callers(
+    index: Index,
+    target: str,
+    path: str | None = None,
+    limit: int = 40,
+) -> str:
+    """
+    The lines that call or reference a symbol, each under the symbol it sits in. target is a name or
+    "Class.method". The definitions, and mentions in comments, are left out. A line that may not call this symbol,
+    such as a method called on a variable whose class isn't known, ends with POSSIBLE_MARK.
+    """
+    index.refresh()
+    parent, name = _split_qualified(target)
+
+    with index.connect() as session:
+        named = [hit for hit in session.symbols_named(name, None, None, None) if hit.place.in_working_tree]
+        targets = [hit for hit in named if not parent or (hit.parent or "").lower() == parent.lower()]
+        if not targets:
+            return f"No symbol called {target!r}. Use find to search by part of a name."
+
+        # A method name given without its class stands for that class when only one class defines it.
+        owners = {hit.parent for hit in targets}
+        owner = parent or (owners.pop() if len(owners) == 1 else None)
+        is_member = any(hit.parent and hit.kind not in TYPE_KINDS for hit in targets)
+        definitions = {(hit.place.path, hit.line) for hit in named}
+
+        matcher = re.compile(rf"(?<![\w$]){re.escape(name)}(?!\w)")
+        literals = [name] if len(name) >= 3 else []
+        live = [place for place in session.live_places_with_text(literals) if path_matches(place.path, path)]
+
+        found = TextMatches([])
+        for place in live:
+            text = index.read_live(place.path)
+            if text is None:
+                continue
+
+            calls = _calls_in(
+                place.path, text, matcher, definitions, owner, is_member, session.symbols_in_blob(place.blob_row)
+            )
+            if not calls:
+                continue
+
+            found.hits += len(calls)
+            found.files += 1
+            if found.shown < limit:
+                shown = calls[: limit - found.shown]
+                marks = {number: POSSIBLE_MARK for number, _, certain in shown if not certain}
+                symbols = session.symbols_in_blob(place.blob_row)
+                found.lines.extend(_lines_under_symbols(place.ref, symbols, [(n, line) for n, line, _ in shown], marks))
+                found.shown += len(shown)
+
+    if not found.lines:
+        return f"Nothing calls or references {target!r} in live files."
+    return "\n".join([found.summary(), *found.lines])
+
+
+def _calls_in(
+    path: str,
+    text: str,
+    matcher: re.Pattern[str],
+    definitions: set[tuple[str, int]],
+    owner: str | None,
+    is_member: bool,
+    symbols: list[SymbolHit],
+) -> list[tuple[int, str, bool]]:
+    """
+    The lines of one file that call or reference the symbol, as (line number, line, certain). A line with several
+    matches takes the most certain one.
+    """
+    lines = split_lines(text)
+    matches = [
+        (number, match.start())
+        for number, line in enumerate(lines, 1)
+        if (path, number) not in definitions
+        for match in matcher.finditer(line)
+    ]
+    roles = text_roles(path, text, [(number, column + 1) for number, column in matches])
+
+    best: dict[int, bool] = {}
+    for (number, column), role in zip(matches, roles):
+        if role == "comment":
+            continue
+
+        enclosing = _innermost([symbol for symbol in symbols if symbol.kind in TYPE_KINDS], number)
+        certainty = _call_certainty(lines[number - 1][:column], owner, is_member, enclosing.name if enclosing else None)
+        if certainty is not None:
+            best[number] = best.get(number, False) or (certainty and role == "code")
+
+    return [(number, lines[number - 1], certain) for number, certain in sorted(best.items())]
+
+
+def _call_certainty(
+    before: str,
+    owner: str | None,
+    is_member: bool,
+    enclosing: str | None,
+) -> bool | None:
+    """
+    Whether a match is certainly the symbol (True), may be it (False) or is not it (None). before is the text before
+    the match on its line, owner the class that defines the symbol and enclosing the class the match sits in.
+    """
+    receiver = RECEIVER.search(before)
+    if receiver is None:
+        # A method is called through sonething that holds it. A bare name of a method is likely a function.
+        return not is_member
+
+    holder, operator = receiver.groups()
+    holder = holder.rsplit("\\", 1)[-1].lower()
+    if operator == "\\":
+        # A namespace, as in App\Deepgram.
+        return True
+    if not is_member:
+        # A function called through something, such as module.function(), may be another symbol with that name.
+        return False
+
+    if holder in {"$this", "this", "self", "static"}:
+        return owner is not None and enclosing is not None and enclosing.lower() == owner.lower()
+    if owner is not None and holder == owner.lower():
+        return True
+    if holder == "parent":
+        return False
+    if operator == "::" or (operator == "." and receiver.group(1)[:1].isupper()):
+        # A static call on another class.
+        return None
+
+    return False
 
 
 def outline(index: Index, path: str, ref: str | None = None) -> str:
@@ -752,7 +887,8 @@ def _matching_lines(
             continue
 
         symbols = session.symbols_in_blob(place.blob_row)
-        found.lines.extend(_lines_under_symbols(place.ref, symbols, matches[: settings.LINES_PER_FILE], matcher))
+        definitions = {symbol.line: DEFINITION_MARK for symbol in symbols if _is_defined_by(symbol, matches, matcher)}
+        found.lines.extend(_lines_under_symbols(place.ref, symbols, matches[: settings.LINES_PER_FILE], definitions))
         found.shown += min(len(matches), settings.LINES_PER_FILE)
         if len(matches) > settings.LINES_PER_FILE:
             found.lines.append(f"({len(matches) - settings.LINES_PER_FILE} more matching lines in {place.ref})")
@@ -761,16 +897,29 @@ def _matching_lines(
     return found
 
 
+def _is_defined_by(symbol: SymbolHit, matches: list[tuple[int, str]], matcher: re.Pattern[str]) -> bool:
+    """
+    True when a matching line is where the symbol is defined, and the match is about the symbol: the pattern matches
+    its name, as "bandana" doies, or the matched text holds its name, as "function bandana" does.
+    """
+    line = next((line for number, line in matches if number == symbol.line), None)
+    if line is None:
+        return False
+
+    matched = matcher.search(line)
+    return bool(matcher.search(symbol.name)) or (matched is not None and symbol.name in matched.group(0))
+
+
 def _lines_under_symbols(
     ref: str,
     symbols: list[SymbolHit],
     matches: list[tuple[int, str]],
-    matcher: re.Pattern[str] | None = None,
+    marks: dict[int, str] | None = None,
 ) -> list[str]:
     """
     One file's matching lines as "path:line:text". Where the enclosing symbol changes, its first line comes before
-    them as a context line, "path-line-text", the way grep and ripgrep print context. A line that defines a symbol
-    whose name the matcher matches ends with DEFINITION_MARK.
+    them as a context line, "path-line-text", the way grep and ripgrep print context. marks holds text to add to
+    the end of some lines, by line number.
     """
     output: list[str] = []
     last_symbol: SymbolHit | None = None
@@ -781,9 +930,7 @@ def _lines_under_symbols(
             output.append(f"{ref}-{symbol.line}-{symbol.signature}")
         last_symbol = symbol
 
-        text = line.strip()[: settings.MAX_LINE_LENGTH]
-        if matcher and any(other.line == number and matcher.search(other.name) for other in symbols):
-            text += DEFINITION_MARK
+        text = line.strip()[: settings.MAX_LINE_LENGTH] + (marks or {}).get(number, "")
         output.append(f"{ref}:{number}:{text}")
 
     return output

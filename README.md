@@ -47,6 +47,7 @@ src/BananaBender.php:2:class BananaBender extends Lady
 ```bash
 what src/BananaBender.php:45-80  # those lines
 what show Banana.bend            # one method
+what callers Banana.bend         # the lines that call it
 what grep "str_repeat("          # text, under the symbol it sits in
 what show Banana.bend --ref origin/dev  # the method as it is on another branch
 ```
