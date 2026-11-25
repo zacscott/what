@@ -33,6 +33,8 @@ class Index:
 
         cache_dir = cache_dir or Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "what"
         cache_dir.mkdir(parents=True, exist_ok=True)
+        # The folder that holds this index, and the index of dependencies that every repository shares.
+        self.cache_dir = cache_dir
 
         # Two checkouts can share a folder name, so the file name also carries a hash of the full path.
         digest = hashlib.sha1(str(self.root).encode()).hexdigest()[:10]
@@ -164,8 +166,12 @@ class Index:
 
     def read_live(self, path: str) -> str | None:
         """The text of a file in the working tree, or None when it is binary, too big or gone."""
+        return self.read_text(self.root / path)
+
+    def read_text(self, path: Path) -> str | None:
+        """The text of a file on disk, or None when it is binary, too big or gone."""
         try:
-            content = (self.root / path).read_bytes()
+            content = path.read_bytes()
         except OSError:
             return None
 

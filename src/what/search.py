@@ -7,9 +7,11 @@ import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from functools import cache
+from pathlib import Path
 
-from what import git
+from what import dependencies, git
 from what.config import settings
+from what.dependencies import DependencyReach
 from what.index import Index
 from what.models import IndexSession, Place, Scope, SymbolHit, age, path_matches
 from what.symbols import Symbol, extract, split_lines, text_roles
@@ -48,6 +50,7 @@ def lookup(
     limit: int = 30,
     ref: str | None = None,
     branches: bool = False,
+    deps: DependencyReach = DependencyReach.FALLBACK,
 ) -> str:
     """
     Run the search that fits the query. A line range such as "src/a.py:45-80" is shown. A query that
@@ -59,7 +62,7 @@ def lookup(
     index.refresh()
 
     if LINE_RANGE.fullmatch(query):
-        return _show(index, query, path)
+        return _show(index, query, path, deps)
 
     # A plain word is always a name. Scripts like bin/refresh are often named after a function, and the function
     # is what a search for "refresh" wants.
@@ -69,8 +72,8 @@ def lookup(
         defines_something = len(places) == 1 and bool(session.symbols_in_blob(places[0].blob_row))
 
     if len(places) != 1:
-        return _find(index, query, kind, path, limit, branches)
-    return _outline(index, query) if defines_something else _show(index, query, None)
+        return _find(index, query, kind, path, limit, branches, deps)
+    return _outline(index, query) if defines_something else _show(index, query, None, deps)
 
 
 def _lookup_at_ref(
@@ -100,17 +103,18 @@ def find(
     limit: int = 30,
     ref: str | None = None,
     branches: bool = False,
+    deps: DependencyReach = DependencyReach.FALLBACK,
 ) -> str:
     """
     Symbols and file paths whose name matches the query. With a ref, the search reads the files at that ref from git
-    in place of the wokring tree. Other branches are searched as well when branches is True, or when the working
-    tree has no match.
+    in place of the working tree. Other branches are searched as well when branches is True, or when the working
+    tree has no match. deps says when the installed dependencies are searched.
     """
     if ref is not None:
         return _find_at_ref(index, query, kind, path, limit, ref)
 
     index.refresh()
-    return _find(index, query, kind, path, limit, branches)
+    return _find(index, query, kind, path, limit, branches, deps)
 
 
 def _find(
@@ -120,6 +124,7 @@ def _find(
     path: str | None,
     limit: int,
     branches: bool,
+    deps: DependencyReach,
 ) -> str:
     words = query.split()
     if not words:
@@ -137,17 +142,44 @@ def _find(
     elsewhere = (
         _find_on_branches(index, name, words, parent, kind, path, limit, bool(here)) if branches or not here else []
     )
+
+    notes: list[str] = []
+    if deps != DependencyReach.FALLBACK or not here:
+        package_hits, notes = _dependency_symbols(index, name, words, parent, kind, deps)
+        elsewhere += _found_lines(_ranked(package_hits), [], limit)
+
     if here or elsewhere:
-        return "\n".join(here + elsewhere)
+        return "\n".join(here + elsewhere + notes)
 
     if kind:
-        return f"No {kind} named {query!r}. Run find without kind to see other matches."
+        return "\n".join([f"No {kind} named {query!r}. Run find without kind to see other matches.", *notes])
 
     # A grammar can miss a definition, so the text of the files is searched before saying "nothing".
     text_matches = _text_search(index, query, False, path, limit, False).lines
     if not text_matches:
-        return f"Nothing named or containing {query!r} in live or deleted files or on other branches."
-    return "\n".join([f"No symbol or path named {query!r}. Text matches:", *text_matches])
+        nothing = f"Nothing named or containing {query!r} in live or deleted files, other branches or dependencies."
+        return "\n".join([nothing, *notes])
+    return "\n".join([f"No symbol or path named {query!r}. Text matches:", *text_matches, *notes])
+
+
+def _dependency_symbols(
+    index: Index,
+    name: str,
+    words: list[str],
+    parent: str | None,
+    kind: str | None,
+    deps: DependencyReach,
+) -> tuple[list[list[SymbolHit]], list[str]]:
+    """
+    Symbols in the installed dependencies that match a name, in the tiers find ranks, and a note for each lockfile
+    with packages that aren't installed.
+    """
+    installed = dependencies.installed(index.root, deps == DependencyReach.ALL)
+    packages = dependencies.package_rows(index, installed.packages)
+    if not packages:
+        return [], installed.notes
+
+    return dependencies.find_symbols(index, packages, name, words, parent, kind), installed.notes
 
 
 def _find_on_branches(
@@ -266,11 +298,13 @@ def grep(
     deleted: bool = False,
     commits: bool = False,
     branches: bool = False,
+    deps: DependencyReach = DependencyReach.FALLBACK,
 ) -> str:
     """
     Lines containing the pattern, each under the symbol it sits in. Deleted
     files are searched when asked for, or when no live file matches. Other
     branches are searched when asked for, or when no live or deleted file matches.
+    The installed dependencies are searched only when deps asks for them.
     """
     index.refresh()
 
@@ -279,11 +313,23 @@ def grep(
     except re.error as error:
         return f"Invalid regex: {error}"
 
+    notes: list[str] = []
+    if deps != DependencyReach.FALLBACK:
+        installed = dependencies.installed(index.root, deps == DependencyReach.ALL)
+        packages = dependencies.package_rows(index, installed.packages)
+        places = [place for place in dependencies.source_places(index, packages) if path_matches(place.path, path)]
+        with index.connect() as session:
+            found.add(
+                _matching_lines(session, _file_texts(index, places), _matcher(pattern, regex)[0], limit, len(places))
+            )
+        notes = installed.notes
+
     output = [found.summary(), *found.lines] if found.lines else []
     if branches or not found.lines:
         output.extend(_grep_on_branches(index, pattern, regex, path, limit, bool(found.lines)))
     if commits:
         output.extend(_commits_changing(index, pattern))
+    output.extend(notes)
 
     # Only a search of deleted files can miss what the unfinished history build hasn't read yet.
     note = _history_note(index) if deleted else ""
@@ -361,8 +407,17 @@ def _text_search(
     """The lines a text search matched, with no lines when nothing matches."""
     matcher, literals = _matcher(pattern, regex)
 
+    # Installed dependencies would bury the repository's own code. grep reads them only when asked to.
+    skipped = tuple(dependencies.dependency_folders(index.root))
+
     with index.connect() as session:
-        live = [place for place in session.live_places_with_text(literals) if path_matches(place.path, path)]
+        live = [
+            place
+            for place in session.live_places_with_text(literals)
+            if path_matches(place.path, path)
+            and not place.path.startswith(skipped)
+            and "/node_modules/" not in place.path
+        ]
         texts = ((place, index.read_live(place.path)) for place in live)
 
         found = _matching_lines(session, texts, matcher, limit, len(live))
@@ -388,6 +443,11 @@ def _matcher(pattern: str, regex: bool) -> tuple[re.Pattern[str], list[str]]:
     matcher = re.compile(pattern if regex else re.escape(pattern), flags)
     literals = required_literals(pattern) if regex else [pattern] if len(pattern) >= 3 else []
     return matcher, literals
+
+
+def _file_texts(index: Index, places: list[Place]) -> Iterator[tuple[Place, str | None]]:
+    """The text of files in installed dependencies, read from disk in order."""
+    return ((place, index.read_text(Path(place.package_folder or "") / place.path)) for place in places)
 
 
 def _git_texts(index: Index, places: list[Place]) -> Iterator[tuple[Place, str | None]]:
@@ -575,20 +635,27 @@ def show(
     target: str,
     path: str | None = None,
     ref: str | None = None,
+    deps: DependencyReach = DependencyReach.FALLBACK,
 ) -> str:
     """
     The source of one symbol, a line range or a whole file. target is a symbol
     name ("bandana", "BananaBender.bandana"), "path:45-80" or a path. Deleted
-    files are read from git. With a ref, the source is read at that ref.
+    files are read from git. With a ref, the source is read at that ref. deps
+    says when a symbol is looked for in the installed dependencies.
     """
     if ref is not None:
         return _show_at_ref(index, target, path, ref)
 
     index.refresh()
-    return _show(index, target, path)
+    return _show(index, target, path, deps)
 
 
-def _show(index: Index, target: str, path: str | None) -> str:
+def _show(
+    index: Index,
+    target: str,
+    path: str | None,
+    deps: DependencyReach,
+) -> str:
     with index.connect() as session:
         line_range = LINE_RANGE.fullmatch(target)
         places = _resolve_path(session, line_range.group(1) if line_range else target)
@@ -606,12 +673,20 @@ def _show(index: Index, target: str, path: str | None) -> str:
             hit for hit in _find_symbols(session, name, [name], parent, None, path) if hit.name.lower() == name.lower()
         ]
 
+    notes: list[str] = []
+    if deps != DependencyReach.FALLBACK or not hits:
+        package_hits, notes = _dependency_symbols(index, name, [name], parent, None, deps)
+        # When dependencies were asked for, their source is what the reader wants to see first.
+        hits = (
+            _ranked(package_hits[:1]) + hits if deps != DependencyReach.FALLBACK else hits + _ranked(package_hits[:1])
+        )
+
     if not hits:
         if len(places) > 1:
             return _path_choices(target, places)
-        return f"No symbol or file called {target!r}. Use find to search by part of a name."
+        return "\n".join([f"No symbol or file called {target!r}. Use find to search by part of a name.", *notes])
 
-    return _show_hits(index, hits)
+    return "\n".join([_show_hits(index, hits), *notes])
 
 
 def _show_at_ref(
@@ -870,7 +945,7 @@ def _matching_lines(
     read = 0
 
     for place, text in texts:
-        if read >= settings.COUNT_FILES:
+        if found.shown >= limit and read >= settings.COUNT_FILES:
             break
         read += 1
         if text is None:
@@ -962,6 +1037,8 @@ def _read(index: Index, place: Place) -> str | None:
     """The text of a file, from disk or from git. None when it is binary, too big or gone."""
     if place.in_working_tree:
         return index.read_live(place.path)
+    if place.package_folder is not None:
+        return index.read_text(Path(place.package_folder) / place.path)
 
     content = next(iter(git.read_blobs(index.root, [place.oid])))[1]
     return content.decode("utf-8", "replace") if content else None

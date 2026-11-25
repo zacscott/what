@@ -13,8 +13,8 @@ SHOW_MAX_LINES = 400
 
 # Limits on slow work.
 
-# How many candidate files a text search reads to count its hits, after it has shown its limit. A pattern with no
-# plain text makes every file a candidate.
+# How many candidate files a text search reads in all, once it has shown its limit and is only counting the hits it
+# leaves out. A pattern with no plain text makes every file a candidate.
 COUNT_FILES = 2000
 
 # How many deleted files, or files on other branches, a text search reads from git. Each one costs a blob read.
@@ -35,6 +35,10 @@ MAX_BYTES = 1_000_000
 
 # Files matching these keep their path in the index but not their text or symbols.
 SKIPPED_NAMES = ["*.min.js", "*.min.css", "*.map", "*.lock", "package-lock.json", "*.svg", "*.snap"]
+
+# The files of an installed dependency that are parsed for its symbols. A package also holds docs, data and
+# built assets, which have nothing to find.
+DEPENDENCY_SUFFIXES = (".php", ".py", ".pyi", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx")
 
 # Data and markup formats have no definitions to find, so parsing them is wasted time.
 NO_SYMBOLS = {"json", "yaml", "toml", "xml", "markdown", "html", "css", "csv", "svg"}

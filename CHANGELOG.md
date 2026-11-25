@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- `find` and `show` look in the installed dependencies when the repository has no match, and `--deps` searches them every time. Each hit is labelled with its package and version, such as `vendor: robmorgan/phinx@0.16.1`. `grep` searches the dependencies' text only with `--deps`. The installed versions come from `composer.lock`, `package-lock.json`, `uv.lock` and `poetry.lock`. Only direct dependencies are searched unless `--all-deps` is given. Their symbols are indexed once for each package version, in an index every repository shares. A lockfile with packages that aren't installed gets a one-line note.
+
 - `what callers <symbol>` lists the lines that call or reference a symbol, each under the function it sits in. It leaves out the definitions and mentions in comments and docblocks. A call that may be to another symbol, such as a method called on an untyped variable, ends with `[possible]`.
 
 - `find` and `grep` search other branches when the working tree has no match, and `--branches` searches them every time. They search the default branch and every local and remote-tracking branch that isn't merged into it. A hit is shown only where the branch's version of the file differs from the working tree, and is labelled with the branch and the age of its last commit. When remote-tracking branches were searched, the output says when they were last fetched.

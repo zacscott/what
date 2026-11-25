@@ -7,6 +7,7 @@ import pytest
 from conftest import BENDER, SPLIT, git
 
 from what import search
+from what.config import settings
 from what.git import UnknownRef
 from what.index import Index
 
@@ -124,6 +125,17 @@ def test_grep_counts_the_hits_it_leaves_out(index: Index, repo: Path) -> None:
 
     assert output[0] == "10 hits in 5 files, 4 shown. Use --limit or --path to see more."
     assert len([line for line in output if ":pip" in line]) == 4
+
+
+def test_grep_reads_past_the_count_limit_until_it_has_shown_its_limit(
+    index: Index,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "COUNT_FILES", 1)
+    (repo / "src/q.txt").write_text("qxq\n")
+
+    assert "src/q.txt:1:qxq" in search.grep(index, "q.q", regex=True)
 
 
 def test_grep_prints_the_history_notice_only_for_a_deleted_file_search(index: Index) -> None:

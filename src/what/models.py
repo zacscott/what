@@ -10,6 +10,7 @@ holds where it differs from its base. The symbols and text_fts tables hold what 
 
 import enum
 import fnmatch
+import re
 import sqlite3
 import time
 from collections.abc import Generator
@@ -85,6 +86,38 @@ CREATE TABLE meta (
 );
 """
 
+# Changing the dependency tables means raising this. A dependency index with another version is rebuilt from nothing.
+DEPENDENCY_SCHEMA_VERSION = 1
+
+# The index of installed dependencies, which every repository shares. A row in packages is one version of one
+# package, and is written only once its files and symbols are all in. Paths are relative to the package's folder.
+DEPENDENCY_SCHEMA = """
+CREATE TABLE packages (
+    id INTEGER PRIMARY KEY,
+    ecosystem TEXT NOT NULL,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    UNIQUE (ecosystem, name, version)
+);
+CREATE TABLE package_files (
+    package INTEGER NOT NULL,
+    path TEXT NOT NULL
+);
+CREATE INDEX package_files_package ON package_files (package);
+CREATE TABLE package_symbols (
+    package INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    name TEXT NOT NULL COLLATE NOCASE,
+    kind TEXT NOT NULL,
+    parent TEXT COLLATE NOCASE,
+    line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    signature TEXT NOT NULL
+);
+CREATE INDEX package_symbols_name ON package_symbols (name);
+CREATE INDEX package_symbols_package ON package_symbols (package);
+"""
+
 
 class Scope(enum.Enum):
     """Which files a search reads."""
@@ -101,7 +134,9 @@ class Place:
     """
     Where a file's content comes from. commit is set only for a deleted file. tree is set only for a file read at a
     git ref, and holds the ref as the user gave it, such as "origin/dev". branch is set only for a file on another
-    branch, with branch_date the time of the branch's last commit.
+    branch, with branch_date the time of the branch's last commit. package is set only for a file in an installed
+    dependency, with the package's label, such as "vendor: robmorgan/phinx@0.16.1". Its path is then relative to
+    package_folder.
     """
 
     path: str
@@ -111,6 +146,8 @@ class Place:
     tree: str | None = None
     branch: str | None = None
     branch_date: int | None = None
+    package: str | None = None
+    package_folder: str | None = None
 
     @property
     def ref(self) -> str:
@@ -119,6 +156,8 @@ class Place:
         before the one that deleted it, such as "a1b2c3d4^:legacy/split.py". A file at a ref is named
         "origin/dev:src/a.py".
         """
+        if self.package is not None:
+            return f"{self.package} {self.path}"
         if self.branch is not None:
             return f"{self.branch} ({age(self.branch_date or 0)}) {self.path}"
         if self.tree is not None:
@@ -131,7 +170,7 @@ class Place:
     @property
     def in_working_tree(self) -> bool:
         """True when the file is read from disk, and False when it is read from git."""
-        return self.commit is None and self.tree is None and self.branch is None
+        return self.commit is None and self.tree is None and self.branch is None and self.package is None
 
 
 @dataclass(frozen=True)
@@ -150,12 +189,17 @@ class SymbolHit:
     signature: str
 
 
-class IndexSession:
-    """One open connection to the index, with the queries that read and write it."""
+class _Session:
+    """One open connection to an SQLite file, which creates the tables when the file is new or has an old schema."""
 
-    def __init__(self, db: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        db: sqlite3.Connection,
+        schema: str,
+        version: int,
+    ) -> None:
         self._db = db
-        self._ensure_schema()
+        self._ensure_schema(schema, version)
 
     @contextmanager
     def write_transaction(self) -> Generator[None]:
@@ -166,6 +210,36 @@ class IndexSession:
         self._db.execute("BEGIN IMMEDIATE")
         yield
         self._db.execute("COMMIT")
+
+    def _ensure_schema(self, schema: str, version: int) -> None:
+        """Create the tables when the file is new or has an old schema  version."""
+        if self._schema_version() == version:
+            return
+
+        with self.write_transaction():
+            # Another process may have created the tables while this one waited for the lock.
+            if self._schema_version() == version:
+                return
+
+            # The names come from the schema, so a table added to it is dropped too when the version changes.
+            for name in re.findall(r"CREATE (?:VIRTUAL )?TABLE (\w+)", schema):
+                self._db.execute(f"DROP TABLE IF EXISTS {name}")
+
+            for statement in schema.split(";"):
+                if statement.strip():
+                    self._db.execute(statement)
+
+            self._db.execute(f"PRAGMA user_version = {version}")
+
+    def _schema_version(self) -> int:
+        return self._db.execute("PRAGMA user_version").fetchone()[0]
+
+
+class IndexSession(_Session):
+    """One open connection to the index of one repository, with the queries that read and write it."""
+
+    def __init__(self, db: sqlite3.Connection) -> None:
+        super().__init__(db, SCHEMA, SCHEMA_VERSION)
 
     def places_at_path(self, path: str) -> list[Place]:
         """The file at exactly this path, as a list of one, or empty when there is none."""
@@ -511,62 +585,157 @@ class IndexSession:
             parameters = parameters + parameters + path_parameters
 
         hits: list[SymbolHit] = []
-        seen: set[tuple[str, int, int]] = set()
+        seen: set[tuple[str, int, str, int]] = set()
         for row in self._db.execute(sql, parameters):
             file_path, commit, branch, date, *symbol, oid, blob = row
             line = symbol[3]
 
             # Rows on branches come newest branch first, so the first row for a content is the one to keep.
-            if branch is not None and (file_path, blob, line) in seen:
+            if branch is not None and (file_path, blob, symbol[0], line) in seen:
                 continue
-            seen.add((file_path, blob, line))
+            seen.add((file_path, blob, symbol[0], line))
             place = Place(file_path, oid, blob, commit, branch=branch, branch_date=date)
             hits.append(SymbolHit(place, *symbol))
 
         return hits
 
-    def _ensure_schema(self) -> None:
-        """Create the tables when the file is new or has an old schema version."""
-        if self._schema_version() == SCHEMA_VERSION:
-            return
 
-        with self.write_transaction():
-            # Another process may have created the tables while this one waited for the lock.
-            if self._schema_version() == SCHEMA_VERSION:
-                return
+@dataclass(frozen=True)
+class PackageSymbol:
+    """One definition in an installed dependency. path is relative to the package's folder."""
 
-            tables = [
-                "blobs",
-                "symbols",
-                "symbol_names",
-                "files",
-                "deleted",
-                "branches",
-                "branch_files",
-                "text_fts",
-                "meta",
-            ]
-            for name in tables:
-                self._db.execute(f"DROP TABLE IF EXISTS {name}")
+    package: int
+    path: str
+    name: str
+    kind: str
+    parent: str | None
+    line: int
+    end_line: int
+    signature: str
 
-            for statement in SCHEMA.split(";"):
-                if statement.strip():
-                    self._db.execute(statement)
 
-            self._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+class DependencySession(_Session):
+    """One open connection to the index of installed dependencies, which every repository shares."""
 
-    def _schema_version(self) -> int:
-        return self._db.execute("PRAGMA user_version").fetchone()[0]
+    def __init__(self, db: sqlite3.Connection) -> None:
+        super().__init__(db, DEPENDENCY_SCHEMA, DEPENDENCY_SCHEMA_VERSION)
+
+    def package_row(self, ecosystem: str, name: str, version: str) -> int | None:
+        """The row id of one version of a package, or None when it isn't indexed yet."""
+        row = self._db.execute(
+            "SELECT id FROM packages WHERE ecosystem = ? AND name = ? AND version = ?", (ecosystem, name, version)
+        ).fetchone()
+        return row[0] if row else None
+
+    def insert_package(
+        self,
+        ecosystem: str,
+        name: str,
+        version: str,
+        files: dict[str, list[Symbol]],
+    ) -> int:
+        """Store one version of a package, with each of its source files  and the symbols in it. Returns its row id."""
+        insert = "INSERT INTO packages (ecosystem, name, version) VALUES (?, ?, ?) RETURNING id"
+        package: int = self._db.execute(insert, (ecosystem, name, version)).fetchone()[0]
+
+        self._db.executemany(
+            "INSERT INTO package_files (package, path) VALUES (?, ?)", [(package, path) for path in files]
+        )
+        self._db.executemany(
+            "INSERT INTO package_symbols (package, path, name, kind, parent, line, end_line, signature) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (package, path, s.name, s.kind, s.parent, s.line, s.end_line, s.signature)
+                for path, symbols in files.items()
+                for s in symbols
+            ],
+        )
+
+        return package
+
+    def package_files(self, packages: list[int]) -> list[tuple[int, str]]:
+        """Every source file of these packages, as (package row, path)."""
+        sql = f"SELECT package, path FROM package_files WHERE package IN ({_marks(packages)}) ORDER BY package, path"
+        return self._db.execute(sql, packages).fetchall()
+
+    def symbols_named(
+        self,
+        name: str,
+        parent: str | None,
+        kind: str | None,
+        packages: list[int],
+    ) -> list[PackageSymbol]:
+        """Symbols with exactly this name, ignoring case."""
+        return self._matching_symbols("name = ?", [name], parent, kind, packages)
+
+    def symbols_starting_with(
+        self,
+        prefix: str,
+        parent: str | None,
+        kind: str | None,
+        packages: list[int],
+    ) -> list[PackageSymbol]:
+        """Symbols whose name starts with this text."""
+        return self._matching_symbols("name LIKE ? ESCAPE '\\'", [_like_escape(prefix) + "%"], parent, kind, packages)
+
+    def symbols_containing_all(
+        self,
+        words: list[str],
+        parent: str | None,
+        kind: str | None,
+        packages: list[int],
+    ) -> list[PackageSymbol]:
+        """Symbols whose name contains every word."""
+        condition = " AND ".join("name LIKE ? ESCAPE '\\'" for _ in words)
+        return self._matching_symbols(
+            condition, ["%" + _like_escape(word) + "%" for word in words], parent, kind, packages
+        )
+
+    def _matching_symbols(
+        self,
+        condition: str,
+        parameters: list[str],
+        parent: str | None,
+        kind: str | None,
+        packages: list[int],
+    ) -> list[PackageSymbol]:
+        values: list[str | int] = [*parameters]
+        if parent:
+            condition += " AND parent = ?"
+            values.append(parent)
+        if kind:
+            condition += " AND kind = ?"
+            values.append(kind.lower())
+
+        sql = f"""
+            SELECT package, path, name, kind, parent, line, end_line, signature FROM package_symbols
+            WHERE {condition} AND package IN ({_marks(packages)})
+            LIMIT {TIER_FETCH}
+        """
+        return [PackageSymbol(*row) for row in self._db.execute(sql, [*values, *packages])]
 
 
 @contextmanager
 def connect(path: Path) -> Generator[IndexSession]:
     """Open the index. When the file is new or has an old schema version, this creates the tables first."""
+    with _open(path) as db:
+        yield IndexSession(db)
+
+
+@contextmanager
+def connect_dependencies(path: Path) -> Generator[DependencySession]:
+    """Open the shared index of dependencies, creating the tables first when it is new or has an old schema version."""
+    with _open(path) as db:
+        yield DependencySession(db)
+
+
+@contextmanager
+def _open(path: Path) -> Generator[sqlite3.Connection]:
     db = sqlite3.connect(path, timeout=60, isolation_level=None)
     try:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA synchronous=NORMAL")
-        yield IndexSession(db)
+        yield db
     finally:
         db.close()
 
@@ -615,6 +784,11 @@ def _path_sql(path_filter: str | None) -> tuple[str, list[str]]:
     if any(wildcard in path_filter for wildcard in "*?["):
         return "(path GLOB ? OR path GLOB ?)", [path_filter, "*/" + path_filter]
     return "path LIKE ? ESCAPE '\\'", ["%" + _like_escape(path_filter) + "%"]
+
+
+def _marks(values: list[int]) -> str:
+    """One "?" for each value, for an IN list. An empty list gives NULL, which matches nothing."""
+    return ", ".join("?" for _ in values) or "NULL"
 
 
 def _in_order(parts: list[str]) -> str:

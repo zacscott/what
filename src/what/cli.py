@@ -7,7 +7,8 @@ from pathlib import Path
 
 import click
 
-from what import directory, git, search
+from what import dependencies, directory, git, search
+from what.dependencies import DependencyReach
 from what.index import Index
 
 DESCRIPTION = """\
@@ -30,12 +31,15 @@ examples:
   what grep "str_repeat("          text, each hit under the function it sits in
   what grep "bend\\w+" --regex --deleted
   what grep "punctuate" --branches  also search unmerged branches
+  what show Phinx\\Db\\Table.addIndex   falls back to installed dependencies
   what callers Banana.bend           the lines that call one method
   what show Banana.bend --ref origin/dev   the method as it is on another branch
 """
 
 PATH_HELP = "only files whose path contains this, or matches this glob"
 BRANCHES_HELP = "also search other branches; without it they are searched only when nothing else matches"
+DEPS_HELP = "also search the direct dependencies installed from the lockfiles"
+ALL_DEPS_HELP = "also search every installed dependency, the dependencies of dependencies included"
 REF_HELP = "search the files at this branch, tag or commit in place of the working tree"
 KIND_HELP = "only this kind: class, function, method, interface, enum..."
 
@@ -78,6 +82,7 @@ def app(build_index: bool, prompt: bool) -> None:
         index.refresh()
         index.refresh_history()
         index.refresh_branches()
+        dependencies.package_rows(index, dependencies.installed(index.root, False).packages)
 
 
 def main() -> None:
@@ -95,6 +100,8 @@ def main() -> None:
 @click.option("--limit", default=30, show_default=True)
 @click.option("--ref", help=REF_HELP)
 @click.option("--branches", is_flag=True, help=BRANCHES_HELP)
+@click.option("--deps", is_flag=True, help=DEPS_HELP)
+@click.option("--all-deps", is_flag=True, help=ALL_DEPS_HELP)
 def lookup(
     query: tuple[str, ...],
     kind: str | None,
@@ -102,9 +109,12 @@ def lookup(
     limit: int,
     ref: str | None,
     branches: bool,
+    deps: bool,
+    all_deps: bool,
 ) -> None:
     """Find a name, list what a file defines or print a line range. what runs this when no command is given."""
-    print(search.lookup(_searchable_index(), " ".join(query), kind, path, limit, ref, branches))
+    reach = _reach(deps, all_deps)
+    print(search.lookup(_searchable_index(), " ".join(query), kind, path, limit, ref, branches, reach))
 
 
 @app.command()
@@ -114,6 +124,8 @@ def lookup(
 @click.option("--limit", default=30, show_default=True)
 @click.option("--ref", help=REF_HELP)
 @click.option("--branches", is_flag=True, help=BRANCHES_HELP)
+@click.option("--deps", is_flag=True, help=DEPS_HELP)
+@click.option("--all-deps", is_flag=True, help=ALL_DEPS_HELP)
 def find(
     query: tuple[str, ...],
     kind: str | None,
@@ -121,9 +133,12 @@ def find(
     limit: int,
     ref: str | None,
     branches: bool,
+    deps: bool,
+    all_deps: bool,
 ) -> None:
     """Find where a class, function, method, type or file is defined, by name or part of one."""
-    print(search.find(_searchable_index(), " ".join(query), kind, path, limit, ref, branches))
+    reach = _reach(deps, all_deps)
+    print(search.find(_searchable_index(), " ".join(query), kind, path, limit, ref, branches, reach))
 
 
 @app.command()
@@ -133,6 +148,8 @@ def find(
 @click.option("--deleted", is_flag=True, help="also search files deleted in git history")
 @click.option("--commits", is_flag=True, help="also list commits that added or removed the text; slow")
 @click.option("--branches", is_flag=True, help=BRANCHES_HELP)
+@click.option("--deps", is_flag=True, help=DEPS_HELP)
+@click.option("--all-deps", is_flag=True, help=ALL_DEPS_HELP)
 @click.option("--limit", default=40, show_default=True)
 def grep(
     pattern: tuple[str, ...],
@@ -141,14 +158,14 @@ def grep(
     deleted: bool,
     commits: bool,
     branches: bool,
+    deps: bool,
+    all_deps: bool,
     limit: int,
 ) -> None:
     """Search file contents. Each hit is listed under the symbol it sits in. Case is ignored unless the pattern has a capital."""
     index = _searchable_index()
-    found = search.grep(
-        index, " ".join(pattern), regex, path, limit, deleted=deleted, commits=commits, branches=branches
-    )
-    print(found)
+    reach = _reach(deps, all_deps)
+    print(search.grep(index, " ".join(pattern), regex, path, limit, deleted, commits, branches, reach))
 
 
 @app.command()
@@ -172,9 +189,24 @@ def outline(path: str, ref: str | None) -> None:
 @click.argument("target")
 @click.option("--path", help="picks the file when several define the symbol")
 @click.option("--ref", help=REF_HELP)
-def show(target: str, path: str | None, ref: str | None) -> None:
+@click.option("--deps", is_flag=True, help=DEPS_HELP)
+@click.option("--all-deps", is_flag=True, help=ALL_DEPS_HELP)
+def show(
+    target: str,
+    path: str | None,
+    ref: str | None,
+    deps: bool,
+    all_deps: bool,
+) -> None:
     """Print the source of one symbol ("Banana.bend"), a line range ("src/a.py:45-80") or a file."""
-    print(search.show(_searchable_index(), target, path, ref))
+    print(search.show(_searchable_index(), target, path, ref, _reach(deps, all_deps)))
+
+
+def _reach(deps: bool, all_deps: bool) -> DependencyReach:
+    """When a search reads the installed dependencies, from the --deps and --all-deps options."""
+    if all_deps:
+        return DependencyReach.ALL
+    return DependencyReach.DIRECT if deps else DependencyReach.FALLBACK
 
 
 def _open_index() -> Index:
