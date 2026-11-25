@@ -5,13 +5,13 @@ a path printed once, with its matches under it as "line: text".
 
 import re
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
 
 from what import git
 from what.config import settings
 from what.index import Index
-from what.models import IndexSession, Place, SymbolHit, path_matches
+from what.models import IndexSession, Place, Scope, SymbolHit, age, path_matches
 from what.symbols import Symbol, extract, split_lines
 
 TYPE_KINDS = {"class", "interface", "trait", "enum", "struct", "type", "module", "namespace", "impl"}
@@ -40,6 +40,7 @@ def lookup(
     path: str | None = None,
     limit: int = 30,
     ref: str | None = None,
+    branches: bool = False,
 ) -> str:
     """
     Run the search that fits the query. A line range such as "src/a.py:45-80" is shown. A query that
@@ -61,7 +62,7 @@ def lookup(
         defines_something = len(places) == 1 and bool(session.symbols_in_blob(places[0].blob_row))
 
     if len(places) != 1:
-        return _find(index, query, kind, path, limit)
+        return _find(index, query, kind, path, limit, branches)
     return _outline(index, query) if defines_something else _show(index, query, None)
 
 
@@ -91,19 +92,28 @@ def find(
     path: str | None = None,
     limit: int = 30,
     ref: str | None = None,
+    branches: bool = False,
 ) -> str:
     """
     Symbols and file paths whose name matches the query. With a ref, the search reads the files at that ref from git
-    in place of the working tree.
+    in place of the wokring tree. Other branches are searched as well when branches is True, or when the working
+    tree has no match.
     """
     if ref is not None:
         return _find_at_ref(index, query, kind, path, limit, ref)
 
     index.refresh()
-    return _find(index, query, kind, path, limit)
+    return _find(index, query, kind, path, limit, branches)
 
 
-def _find(index: Index, query: str, kind: str | None, path: str | None, limit: int) -> str:
+def _find(
+    index: Index,
+    query: str,
+    kind: str | None,
+    path: str | None,
+    limit: int,
+    branches: bool,
+) -> str:
     words = query.split()
     if not words:
         return "Give a symbol name or part of a file path."
@@ -116,16 +126,72 @@ def _find(index: Index, query: str, kind: str | None, path: str | None, limit: i
         if not hits and not paths:
             hits, paths = _find_abbreviated(session, name, parent, kind, path)
 
-    if not hits and kind:
-        return f"No {kind} named {query!r}. Run find without kind to see other matches."
-    if not hits and not paths:
-        # A grammar can miss a definition, so the text of the files is searched before saying "nothing".
-        text_matches = _text_search(index, query, False, path, limit, False).lines
-        if not text_matches:
-            return f"Nothing named or containing {query!r} in live or deleted files."
-        return "\n".join([f"No symbol or path named {query!r}. Text matches:", *text_matches])
+    here = _found_lines(hits, paths, limit) if hits or paths else []
+    elsewhere = (
+        _find_on_branches(index, name, words, parent, kind, path, limit, bool(here)) if branches or not here else []
+    )
+    if here or elsewhere:
+        return "\n".join(here + elsewhere)
 
-    return "\n".join(_found_lines(hits, paths, limit))
+    if kind:
+        return f"No {kind} named {query!r}. Run find without kind to see other matches."
+
+    # A grammar can miss a definition, so the text of the files is searched before saying "nothing".
+    text_matches = _text_search(index, query, False, path, limit, False).lines
+    if not text_matches:
+        return f"Nothing named or containing {query!r} in live or deleted files or on other branches."
+    return "\n".join([f"No symbol or path named {query!r}. Text matches:", *text_matches])
+
+
+def _find_on_branches(
+    index: Index,
+    name: str,
+    words: list[str],
+    parent: str | None,
+    kind: str | None,
+    path: str | None,
+    limit: int,
+    found_here: bool,
+) -> list[str]:
+    """The output of find on other branches, empty when no branch has a match that the working tree lacks."""
+    branches = index.refresh_branches()
+    if not branches:
+        return []
+
+    with index.connect() as session:
+        hits = _find_symbols(session, name, words, parent, kind, path, Scope.BRANCHES)
+        paths = [] if kind else _find_paths(session, words, path, Scope.BRANCHES)
+
+    if not hits and not paths:
+        return []
+
+    places = [hit.place for hit in hits[:limit]] + paths
+    return [
+        _branches_heading(places, found_here),
+        *_found_lines(hits, paths, limit),
+        *_fetch_note(index, branches),
+    ]
+
+
+def _branches_heading(places: list[Place], found_here: bool) -> str:
+    """The line before the matches on other branches, such as "not in this checkout; found on 2 other branches:"."""
+    count = len({place.branch for place in places})
+    branches = "1 other branch" if count == 1 else f"{count} other branches"
+    return f"also on {branches}:" if found_here else f"not in this checkout; found on {branches}:"
+
+
+def _fetch_note(index: Index, branches: list[git.Branch]) -> list[str]:
+    """
+    When remote-tracking branches were searched, a line saying when they were last fetched, so a missing match isn't
+    read as missing code.
+    """
+    if not any(branch.remote for branch in branches):
+        return []
+
+    fetched = git.last_fetch(index.root)
+    if fetched is None:
+        return ["remotes not fetched since the clone"]
+    return [f"remotes fetched {age(int(fetched))}"]
 
 
 def _found_lines(hits: list[SymbolHit], paths: list[Place], limit: int) -> list[str]:
@@ -192,10 +258,12 @@ def grep(
     limit: int = 40,
     deleted: bool = False,
     commits: bool = False,
+    branches: bool = False,
 ) -> str:
     """
     Lines containing the pattern, each under the symbol it sits in. Deleted
-    files are searched when asked for, or when no live file matches.
+    files are searched when asked for, or when no live file matches. Other
+    branches are searched when asked for, or when no live or deleted file matches.
     """
     index.refresh()
 
@@ -205,14 +273,39 @@ def grep(
         return f"Invalid regex: {error}"
 
     output = [found.summary(), *found.lines] if found.lines else []
+    if branches or not found.lines:
+        output.extend(_grep_on_branches(index, pattern, regex, path, limit, bool(found.lines)))
     if commits:
         output.extend(_commits_changing(index, pattern))
 
     # Only a search of deleted files can miss what the unfinished history build hasn't read yet.
     note = _history_note(index) if deleted else ""
     if not output:
-        return f"No text matches for {pattern!r} in live or deleted files." + note
+        return f"No text matches for {pattern!r} in live or deleted files or on other branches." + note
     return "\n".join(output) + note
+
+
+def _grep_on_branches(
+    index: Index,
+    pattern: str,
+    regex: bool,
+    path: str | None,
+    limit: int,
+    found_here: bool,
+) -> list[str]:
+    """The output of grep on other branches, empty when no branch has a match that the working tree lacks."""
+    branches = index.refresh_branches()
+    if not branches:
+        return []
+
+    matcher, literals = _matcher(pattern, regex)
+    with index.connect() as session:
+        places = [place for place in session.branch_places_with_text(literals) if path_matches(place.path, path)]
+        found = _matching_lines(session, _git_texts(index, places), matcher, limit, len(places))
+
+    if not found.lines:
+        return []
+    return [_branches_heading(found.places, found_here), found.summary(), *found.lines, *_fetch_note(index, branches)]
 
 
 @dataclass
@@ -223,6 +316,8 @@ class TextMatches:
     """
 
     lines: list[str]
+    # The files that matched, shown or not.
+    places: list[Place] = field(default_factory=list[Place])
     shown: int = 0
     hits: int = 0
     files: int = 0
@@ -231,6 +326,7 @@ class TextMatches:
 
     def add(self, other: "TextMatches") -> None:
         self.lines.extend(other.lines)
+        self.places.extend(other.places)
         self.shown += other.shown
         self.hits += other.hits
         self.files += other.files
@@ -256,11 +352,7 @@ def _text_search(
     deleted: bool,
 ) -> TextMatches:
     """The lines a text search matched, with no lines when nothing matches."""
-    # The search ignores case unless the pattern has a capital letter in it. An escape like \S is not a capital.
-    letters = re.sub(r"\\.", "", pattern) if regex else pattern
-    flags = 0 if any(letter.isupper() for letter in letters) else re.IGNORECASE
-    matcher = re.compile(pattern if regex else re.escape(pattern), flags)
-    literals = required_literals(pattern) if regex else [pattern] if len(pattern) >= 3 else []
+    matcher, literals = _matcher(pattern, regex)
 
     with index.connect() as session:
         live = [place for place in session.live_places_with_text(literals) if path_matches(place.path, path)]
@@ -276,15 +368,27 @@ def _text_search(
             return found
 
         gone = [place for place in session.deleted_places_with_text(literals) if path_matches(place.path, path)]
-        blobs = git.read_blobs(index.root, [place.oid for place in gone[: settings.DELETED_FILES_READ]])
-
-        deleted_texts = (
-            (place, content.decode("utf-8", "replace") if content else None) for place, (_, content) in zip(gone, blobs)
-        )
-
-        found.add(_matching_lines(session, deleted_texts, matcher, limit, len(gone)))
+        found.add(_matching_lines(session, _git_texts(index, gone), matcher, limit, len(gone)))
 
     return found
+
+
+def _matcher(pattern: str, regex: bool) -> tuple[re.Pattern[str], list[str]]:
+    """The compiled pattern, and the plain text every match must contain, for the trigram index to look up."""
+    # The search ignores case unless the pattern has a capital letter in it. An escape like \S is not a capital.
+    letters = re.sub(r"\\.", "", pattern) if regex else pattern
+    flags = 0 if any(letter.isupper() for letter in letters) else re.IGNORECASE
+    matcher = re.compile(pattern if regex else re.escape(pattern), flags)
+    literals = required_literals(pattern) if regex else [pattern] if len(pattern) >= 3 else []
+    return matcher, literals
+
+
+def _git_texts(index: Index, places: list[Place]) -> Iterator[tuple[Place, str | None]]:
+    """The text of files that git holds, read in order. Only the first settings.GIT_FILES_READ are read."""
+    blobs = git.read_blobs(index.root, [place.oid for place in places[: settings.GIT_FILES_READ]])
+    return (
+        (place, content.decode("utf-8", "replace") if content else None) for place, (_, content) in zip(places, blobs)
+    )
 
 
 def outline(index: Index, path: str, ref: str | None = None) -> str:
@@ -498,13 +602,14 @@ def _find_symbols(
     parent: str | None,
     kind: str | None,
     path: str | None,
+    scope: Scope = Scope.WORKING_TREE,
 ) -> list[SymbolHit]:
     """Symbols matching a name, best first: exact, then prefix, then containing every word."""
     return _ranked(
         [
-            session.symbols_named(name, parent, kind, path),
-            session.symbols_starting_with(name, parent, kind, path),
-            session.symbols_containing_all(words, parent, kind, path),
+            session.symbols_named(name, parent, kind, path, scope),
+            session.symbols_starting_with(name, parent, kind, path, scope),
+            session.symbols_containing_all(words, parent, kind, path, scope),
         ]
     )
 
@@ -567,10 +672,11 @@ def _ranked(tiers: list[list[SymbolHit]]) -> list[SymbolHit]:
     Ran ksymbol hits best first. A hit from an earlier tier ranks first, and a hit that is in several tiers
     keeps its earliest.
     """
-    ranked: dict[tuple[str, str, int], tuple[tuple[int, bool, int, bool, int], SymbolHit]] = {}
+    ranked: dict[tuple[str, int, str, int], tuple[tuple[int, bool, int, bool, int], SymbolHit]] = {}
     for tier, hits in enumerate(tiers):
         for hit in hits:
-            key = (hit.place.path, hit.name, hit.line)
+            # Two branches can hold different versions of one path, so the content is part of the key.
+            key = (hit.place.path, hit.place.blob_row, hit.name, hit.line)
             if key in ranked:
                 continue
             kind_rank = 0 if hit.kind in TYPE_KINDS else 1 if hit.kind in CALLABLE_KINDS else 2
@@ -581,10 +687,15 @@ def _ranked(tiers: list[list[SymbolHit]]) -> list[SymbolHit]:
     return [hit for _, hit in sorted(ranked.values(), key=lambda entry: entry[0])]
 
 
-def _find_paths(session: IndexSession, words: list[str], path_filter: str | None) -> list[Place]:
+def _find_paths(
+    session: IndexSession,
+    words: list[str],
+    path_filter: str | None,
+    scope: Scope = Scope.WORKING_TREE,
+) -> list[Place]:
     """Live then deleted files whose path contains every word, shortest path first."""
     return sorted(
-        (place for place in session.places_containing_all(words) if path_matches(place.path, path_filter)),
+        (place for place in session.places_containing_all(words, scope) if path_matches(place.path, path_filter)),
         key=lambda place: (place.commit is not None, len(place.path)),
     )
 
@@ -636,6 +747,7 @@ def _matching_lines(
 
         found.hits += len(matches)
         found.files += 1
+        found.places.append(place)
         if found.shown >= limit:
             continue
 

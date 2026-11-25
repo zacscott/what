@@ -1,6 +1,7 @@
 """The git commands the index is built from, each as one small function."""
 
 import hashlib
+import os
 import subprocess
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -25,6 +26,20 @@ class Deletion:
     oid: str
     commit: str
     date: str
+
+
+@dataclass(frozen=True)
+class Branch:
+    """
+    A branch other than the one checked out. date is the time of its last commit, in seconds since 1970. remote is
+    True for a remote-tracking branch such as "origin/dev".
+    """
+
+    name: str
+    tip: str
+    date: int
+    remote: bool
+    is_default: bool
 
 
 def run(root: Path, *args: str, stdin: bytes | None = None, timeout: float | None = None) -> bytes:
@@ -119,6 +134,77 @@ def paths_containing(root: Path, commit: str, text: str) -> list[str]:
     return [entry.removeprefix(commit + ":") for entry in _split(output)]
 
 
+def other_branches(root: Path) -> list[Branch]:
+    """
+    The default branch and every local and remote-tracking branch that isn't merged into it, leaving out the branch
+    that is checked out. A merged branch holds nothing the default branch doesn't.
+    """
+    default = default_branch(root)
+    if default is None:
+        return []
+
+    current = _optional(root, "symbolic-ref", "--quiet", "HEAD")
+    fields = "%(refname)%00%(refname:short)%00%(objectname)%00%(committerdate:unix)%00%(symref)"
+    listed = run(root, "for-each-ref", f"--format={fields}", f"--no-merged={default}", "refs/heads", "refs/remotes")
+    listed += run(root, "for-each-ref", f"--format={fields}", default)
+
+    found: dict[str, Branch] = {}
+    for line in listed.decode("utf-8", "replace").splitlines():
+        full_name, name, tip, date, symref = line.split("\0")
+        # origin/HEAD is only another name for a branch that is listed already.
+        if symref or full_name == current:
+            continue
+        remote = full_name.startswith("refs/remotes/")
+        found[full_name] = Branch(name, tip, int(date or 0), remote, full_name == default)
+
+    return list(found.values())
+
+
+def default_branch(root: Path) -> str | None:
+    """
+    The full name of the branch that work merges into, such as "refs/remotes/origin/main". The remote's HEAD
+    decides it when there is one. Without a remote, it is init.defaultBranch, main or master, whichever exists.
+    """
+    remote_head = _optional(root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+    if remote_head:
+        return remote_head
+
+    configured = _optional(root, "config", "init.defaultBranch")
+    for name in [configured, "main", "master"]:
+        if name and _optional(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}"):
+            return f"refs/heads/{name}"
+
+    return None
+
+
+def merge_base(root: Path, first: str, second: str) -> str | None:
+    """The newest commit that both commits have in their history, or None when they share none."""
+    return _optional(root, "merge-base", first, second)
+
+
+def changed_files(root: Path, base: str, tip: str) -> dict[str, str]:
+    """The files that tip adds or changes compared with base, with their blob ids at tip. Deleted files are left out."""
+    files: dict[str, str] = {}
+    entries = _split(run(root, "diff-tree", "-r", "-z", "--no-renames", "--raw", "--no-abbrev", base, tip))
+
+    # With -z, each file is two entries: ":<old mode> <new mode> <old blob> <new blob> <status>", then the path.
+    for details, path in zip(entries[0::2], entries[1::2]):
+        _, new_mode, _, new_oid, status = details.split(" ")
+        if status != "D" and new_mode.startswith("100"):
+            files[path] = new_oid
+
+    return files
+
+
+def last_fetch(root: Path) -> float | None:
+    """When the repository last fetched from a remote, in seconds since 1970. None when it never has."""
+    path = Path(run(root, "rev-parse", "--git-path", "FETCH_HEAD").decode().strip())
+    try:
+        return os.stat(path if path.is_absolute() else root / path).st_mtime
+    except OSError:
+        return None
+
+
 def is_ancestor(root: Path, older: str, newer: str) -> bool:
     """True when the commit newer has the commit older somewhere in its history."""
     command = ["git", "-C", str(root), "merge-base", "--is-ancestor", older, newer]
@@ -209,6 +295,14 @@ def blob_id(content: bytes) -> str:
 def _command(root: Path, *args: str) -> list[str]:
     # With quotePath off, git prints non-ASCII paths as they are and not as escapes.
     return ["git", "-C", str(root), "-c", "core.quotePath=false", *args]
+
+
+def _optional(root: Path, *args: str) -> str | None:
+    """What a git command printed, or None when it failed or printed nothing."""
+    try:
+        return run(root, *args).decode().strip() or None
+    except subprocess.CalledProcessError:
+        return None
 
 
 def _split(output: bytes) -> list[str]:

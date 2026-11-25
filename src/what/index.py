@@ -118,6 +118,38 @@ class Index:
             session.delete_unused_blobs()
             session.set_meta("history_head", current)
 
+    def refresh_branches(self) -> list[git.Branch]:
+        """
+        Index the files that each other branch changes, and return the branches. A branch is read again only when
+        it or HEAD has moved since it was last read.
+
+        The default branch is compared with HEAD, so it shows what HEAD lacks. Every other branch is compared with
+        where it split from HEAD, so it shows only that branch's own work.
+        """
+        current = git.head(self.root) if self.in_git else None
+        if current is None:
+            return []
+
+        branches = git.other_branches(self.root)
+
+        with self.connect() as session:
+            known = session.known_branches()
+            for branch in branches:
+                if known.get(branch.name) == (branch.tip, current):
+                    continue
+
+                base = current if branch.is_default else git.merge_base(self.root, current, branch.tip)
+                changed = git.changed_files(self.root, base, branch.tip) if base else {}
+                self._index_branch(session, branch, current, sorted(changed.items()))
+
+            gone = [name for name in known if name not in {branch.name for branch in branches}]
+            if gone:
+                with session.write_transaction():
+                    session.delete_branches(gone)
+            session.delete_unused_blobs()
+
+        return branches
+
     def history_is_current(self) -> bool:
         if not self.in_git:
             return True
@@ -176,24 +208,50 @@ class Index:
     def _index_deletions(self, session: IndexSession, batch: list[git.Deletion]) -> None:
         # The transaction starts before the check for known blobs, so another process can't delete one in between.
         with session.write_transaction():
-            unread = [
-                deletion.oid
-                for deletion in batch
-                if _has_indexed_text(deletion.path)
-                and session.blob_row(deletion.oid, _parsed_as(deletion.path)) is None
-            ]
-
-            sizes = git.blob_sizes(self.root, unread)
-            small = [
-                oid for oid in dict.fromkeys(unread) if sizes.get(oid, settings.MAX_BYTES + 1) <= settings.MAX_BYTES
-            ]
-
-            texts = {oid: _as_text(content) for oid, content in git.read_blobs(self.root, small) if content is not None}
-
-            for deletion in batch:
-                text = texts.get(deletion.oid) if _has_indexed_text(deletion.path) else None
-                blob = _add_blob(session, deletion.oid, deletion.path, text)
+            blobs = self._add_git_blobs(session, [(deletion.path, deletion.oid) for deletion in batch])
+            for deletion, blob in zip(batch, blobs):
                 session.save_deleted_file(deletion.path, blob, deletion.commit, deletion.date)
+
+    def _index_branch(
+        self,
+        session: IndexSession,
+        branch: git.Branch,
+        head: str,
+        files: list[tuple[str, str]],
+    ) -> None:
+        """
+        Index the files a branch changed, as (path, blob id), and record them under the branch. Each batch's files are
+        saved in the same transaction as their blobs, so another process can't delete the blobs as unused in between.
+        """
+        with session.write_transaction():
+            session.delete_branches([branch.name])
+
+        for start in range(0, len(files), settings.BATCH_SIZE):
+            batch = files[start : start + settings.BATCH_SIZE]
+            with session.write_transaction():
+                blobs = self._add_git_blobs(session, batch)
+                session.save_branch_files(branch.name, [(path, blob) for (path, _), blob in zip(batch, blobs)])
+
+        with session.write_transaction():
+            session.save_branch(branch.name, branch.tip, head, branch.date)
+
+    def _add_git_blobs(self, session: IndexSession, files: list[tuple[str, str]]) -> list[int]:
+        """
+        Index file contents that git holds, given as (path, blob id), and return their blob rows in the same order.
+        Only the contents the index hasn't seen are read. Call this inside a write transaction.
+        """
+        unread = [
+            oid for path, oid in files if _has_indexed_text(path) and session.blob_row(oid, _parsed_as(path)) is None
+        ]
+
+        sizes = git.blob_sizes(self.root, unread)
+        small = [oid for oid in dict.fromkeys(unread) if sizes.get(oid, settings.MAX_BYTES + 1) <= settings.MAX_BYTES]
+
+        texts = {oid: _as_text(content) for oid, content in git.read_blobs(self.root, small) if content is not None}
+
+        return [
+            _add_blob(session, oid, path, texts.get(oid) if _has_indexed_text(path) else None) for path, oid in files
+        ]
 
     @contextmanager
     def _history_lock(self) -> Generator[bool]:

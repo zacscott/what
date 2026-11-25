@@ -4,11 +4,14 @@ module holds SQL.
 
 A row in blobs is one file content, keyed on git's blob id. The files table
 says which content each path holds now. The deleted table says which content
-a deleted path held last. The symbols and text_fts tables hold what each blob's text was indexed as.
+a deleted path held last. The branch_files table says which content each other branch
+holds where it differs from its base. The symbols and text_fts tables hold what each blob's text was indexed as.
 """
 
+import enum
 import fnmatch
 import sqlite3
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -17,7 +20,7 @@ from pathlib import Path
 from what.symbols import Symbol
 
 # Changing the tables means raising this. An index with another version is rebuilt from nothing.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # How many rows one tier of a symbol search fetches before ranking.
 TIER_FETCH = 300
@@ -53,6 +56,21 @@ CREATE TABLE deleted (
     date TEXT NOT NULL
 );
 CREATE INDEX deleted_blob ON deleted (blob);
+-- The branches whose files are indexed. tip is the commit the branch pointed at, and head is the commit HEAD pointed
+-- at, when its files were listed. date is the time of the tip commit, in seconds since 1970.
+CREATE TABLE branches (
+    name TEXT PRIMARY KEY,
+    tip TEXT NOT NULL,
+    head TEXT NOT NULL,
+    date INTEGER NOT NULL
+);
+CREATE TABLE branch_files (
+    branch TEXT NOT NULL,
+    path TEXT NOT NULL,
+    blob INTEGER NOT NULL,
+    PRIMARY KEY (branch, path)
+);
+CREATE INDEX branch_files_blob ON branch_files (blob);
 -- Names of symbols in a trigram index, so a search for part of a name doesn't read every row of symbols. It
 -- reads each name from its symbols row, which a trigram LIKE needs to check a match.
 CREATE VIRTUAL TABLE symbol_names USING fts5(
@@ -68,11 +86,22 @@ CREATE TABLE meta (
 """
 
 
+class Scope(enum.Enum):
+    """Which files a search reads."""
+
+    # The files in the working tree, and the files that HEAD's history deleted.
+    WORKING_TREE = enum.auto()
+
+    # The files on other branches whose content differs from the working tree's file at the same path.
+    BRANCHES = enum.auto()
+
+
 @dataclass(frozen=True)
 class Place:
     """
     Where a file's content comes from. commit is set only for a deleted file. tree is set only for a file read at a
-    git ref, and holds teh ref as the user gave it, such as "origin/dev".
+    git ref, and holds the ref as the user gave it, such as "origin/dev". branch is set only for a file on another
+    branch, with branch_date the time of the branch's last commit.
     """
 
     path: str
@@ -80,6 +109,8 @@ class Place:
     blob_row: int
     commit: str | None = None
     tree: str | None = None
+    branch: str | None = None
+    branch_date: int | None = None
 
     @property
     def ref(self) -> str:
@@ -88,6 +119,8 @@ class Place:
         before the one that deleted it, such as "a1b2c3d4^:legacy/split.py". A file at a ref is named
         "origin/dev:src/a.py".
         """
+        if self.branch is not None:
+            return f"{self.branch} ({age(self.branch_date or 0)}) {self.path}"
         if self.tree is not None:
             return f"{self.tree}:{self.path}"
         if self.commit is not None:
@@ -98,7 +131,7 @@ class Place:
     @property
     def in_working_tree(self) -> bool:
         """True when the file is read from disk, and False when it is read from git."""
-        return self.commit is None and self.tree is None
+        return self.commit is None and self.tree is None and self.branch is None
 
 
 @dataclass(frozen=True)
@@ -136,20 +169,20 @@ class IndexSession:
 
     def places_at_path(self, path: str) -> list[Place]:
         """The file at exactly this path, as a list of one, or empty when there is none."""
-        return self._places_where("path = ?", [path])
+        return self._places_where("path = ?", [path], Scope.WORKING_TREE)
 
     def places_ending_with(self, path: str) -> list[Place]:
         """Every file whose path ends with this one after a slash, so "a.py" matches "src/a.py"."""
-        return self._places_where("path LIKE ? ESCAPE '\\'", ["%/" + _like_escape(path)])
+        return self._places_where("path LIKE ? ESCAPE '\\'", ["%/" + _like_escape(path)], Scope.WORKING_TREE)
 
-    def places_containing_all(self, words: list[str]) -> list[Place]:
+    def places_containing_all(self, words: list[str], scope: Scope = Scope.WORKING_TREE) -> list[Place]:
         """Files whose path contains every word."""
         condition = " AND ".join("path LIKE ? ESCAPE '\\'" for _ in words)
-        return self._places_where(condition, ["%" + _like_escape(word) + "%" for word in words])
+        return self._places_where(condition, ["%" + _like_escape(word) + "%" for word in words], scope)
 
     def places_containing_in_order(self, parts: list[str]) -> list[Place]:
         """Files whose payh contains every part, in order, with anything between."""
-        return self._places_where("path LIKE ? ESCAPE '\\'", [_in_order(parts)])
+        return self._places_where("path LIKE ? ESCAPE '\\'", [_in_order(parts)], Scope.WORKING_TREE)
 
     def live_places_with_text(self, literals: list[str]) -> list[Place]:
         """
@@ -165,15 +198,41 @@ class IndexSession:
         """
         return self._places_with_text(literals, "deleted")
 
+    def branch_places_with_text(self, literals: list[str]) -> list[Place]:
+        """
+        Files on other branches whose text contains every literal, best match first. A content that several branches
+        hold is listed once, for the branch with the newest commit. With no literals, every branch file is a candidate.
+        """
+        not_live = "NOT EXISTS (SELECT 1 FROM files f WHERE f.path = t.path AND f.blob = t.blob)"
+        columns = "t.path, b.oid, b.id, t.branch, br.date"
+        joins = "JOIN blobs b ON b.id = t.blob JOIN branches br ON br.name = t.branch"
+
+        if not literals:
+            sql = f"SELECT {columns} FROM branch_files t {joins} WHERE {not_live} ORDER BY t.path, br.date DESC"
+            rows = self._db.execute(sql)
+        else:
+            match = " AND ".join('"' + literal.replace('"', '""') + '"' for literal in literals)
+            sql = f"""
+                SELECT {columns} FROM text_fts JOIN branch_files t ON t.blob = text_fts.rowid {joins}
+                WHERE text_fts MATCH ? AND {not_live}
+                ORDER BY bm25(text_fts), t.path, br.date DESC
+            """
+            rows = self._db.execute(sql, (match,))
+
+        return _newest_per_content(
+            [Place(path, oid, blob, branch=branch, branch_date=date) for path, oid, blob, branch, date in rows]
+        )
+
     def symbols_named(
         self,
         name: str,
         parent: str | None,
         kind: str | None,
         path: str | None,
+        scope: Scope = Scope.WORKING_TREE,
     ) -> list[SymbolHit]:
         """Symbols with exactly this name, ignoring case."""
-        return self._matching_symbols("s.name = ?", [name], parent, kind, path)
+        return self._matching_symbols("s.name = ?", [name], parent, kind, path, scope)
 
     def symbols_starting_with(
         self,
@@ -181,9 +240,12 @@ class IndexSession:
         parent: str | None,
         kind: str | None,
         path: str | None,
+        scope: Scope = Scope.WORKING_TREE,
     ) -> list[SymbolHit]:
         """Symbols whose name starts with this text."""
-        return self._matching_symbols("s.name LIKE ? ESCAPE '\\'", [_like_escape(prefix) + "%"], parent, kind, path)
+        return self._matching_symbols(
+            "s.name LIKE ? ESCAPE '\\'", [_like_escape(prefix) + "%"], parent, kind, path, scope
+        )
 
     def symbols_containing_all(
         self,
@@ -191,6 +253,7 @@ class IndexSession:
         parent: str | None,
         kind: str | None,
         path: str | None,
+        scope: Scope = Scope.WORKING_TREE,
     ) -> list[SymbolHit]:
         """Symbols whose name contains every word."""
         conditions = ["s.name LIKE ? ESCAPE '\\'" for _ in words]
@@ -204,7 +267,7 @@ class IndexSession:
             conditions.append("s.rowid IN (SELECT rowid FROM symbol_names WHERE name LIKE ?)")
             parameters.append("%" + longest.replace("%", "") + "%")
 
-        return self._matching_symbols(" AND ".join(conditions), parameters, parent, kind, path)
+        return self._matching_symbols(" AND ".join(conditions), parameters, parent, kind, path, scope)
 
     def symbols_containing_in_order(
         self,
@@ -214,7 +277,9 @@ class IndexSession:
         path: str | None,
     ) -> list[SymbolHit]:
         """Symbols whose name contains every part, in order, with anything between."""
-        return self._matching_symbols("s.name LIKE ? ESCAPE '\\'", [_in_order(parts)], parent, kind, path)
+        return self._matching_symbols(
+            "s.name LIKE ? ESCAPE '\\'", [_in_order(parts)], parent, kind, path, Scope.WORKING_TREE
+        )
 
     def symbols_in_blob(self, blob: int) -> list[SymbolHit]:
         """
@@ -267,7 +332,8 @@ class IndexSession:
     def delete_unused_blobs(self) -> None:
         """Delete every content that no live or deleted file holds, wiht its text and symbols."""
         unused = (
-            "SELECT id FROM blobs WHERE id NOT IN (SELECT blob FROM files) AND id NOT IN (SELECT blob FROM deleted)"
+            "SELECT id FROM blobs WHERE id NOT IN (SELECT blob FROM files) AND id NOT IN (SELECT blob FROM deleted) "
+            "AND id NOT IN (SELECT blob FROM branch_files)"
         )
 
         with self.write_transaction():
@@ -308,6 +374,34 @@ class IndexSession:
         """Forget every deleted path, so the next history build starts again."""
         self._db.execute("DELETE FROM deleted")
 
+    def known_branches(self) -> dict[str, tuple[str, str]]:
+        """Every indexed branch, with the commits its tip and HEAD pointed at when its files were listed."""
+        return {name: (tip, head) for name, tip, head in self._db.execute("SELECT name, tip, head FROM branches")}
+
+    def save_branch_files(self, name: str, files: list[tuple[str, int]]) -> None:
+        """Record the contetn of files a branch changed, as (path, blob row)."""
+        self._db.executemany(
+            "INSERT OR REPLACE INTO branch_files (branch, path, blob) VALUES (?, ?, ?)",
+            [(name, path, blob) for path, blob in files],
+        )
+
+    def save_branch(
+        self,
+        name: str,
+        tip: str,
+        head: str,
+        date: int,
+    ) -> None:
+        """Record that a branch's files were listed when it pointed at tip and HEAD pointed at head."""
+        self._db.execute(
+            "INSERT OR REPLACE INTO branches (name, tip, head, date) VALUES (?, ?, ?, ?)", (name, tip, head, date)
+        )
+
+    def delete_branches(self, names: list[str]) -> None:
+        """Forget these branches and their files. Their blobs stay until delete_unused_blobs runs."""
+        self._db.executemany("DELETE FROM branch_files WHERE branch = ?", [(name,) for name in names])
+        self._db.executemany("DELETE FROM branches WHERE name = ?", [(name,) for name in names])
+
     def meta(self, key: str) -> str | None:
         """A value the index keeps about itself, or None when it has never been set."""
         row = self._db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
@@ -317,8 +411,23 @@ class IndexSession:
         """Record a value the index keeps about itself."""
         self._db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
 
-    def _places_where(self, condition: str, parameters: list[str]) -> list[Place]:
-        """Files matching a condition on path. A path that exists now is never also listed as deleted."""
+    def _places_where(self, condition: str, parameters: list[str], scope: Scope) -> list[Place]:
+        """
+        Files matching a condition on path. A path that exists now is never also listed as deleted, or as on
+        another branch.
+        """
+        if scope == Scope.BRANCHES:
+            sql = f"""
+                SELECT t.path, b.oid, b.id, t.branch, br.date
+                FROM branch_files t JOIN blobs b ON b.id = t.blob JOIN branches br ON br.name = t.branch
+                WHERE {condition} AND t.path NOT IN (SELECT path FROM files)
+                ORDER BY br.date DESC
+            """
+            rows = self._db.execute(sql, parameters)
+            return _newest_per_content(
+                [Place(path, oid, blob, branch=branch, branch_date=date) for path, oid, blob, branch, date in rows]
+            )
+
         sql = f"""
             SELECT f.path, b.oid, b.id, NULL FROM files f JOIN blobs b ON b.id = f.blob WHERE {condition}
             UNION ALL
@@ -353,8 +462,13 @@ class IndexSession:
         parent: str | None,
         kind: str | None,
         path_filter: str | None,
+        scope: Scope,
     ) -> list[SymbolHit]:
-        """Live then deleted symbols matching a condition on the symbols table, in files the path filter allows."""
+        """
+        Symbols matching a condition on the symbols table, in files the path filter allows. In the working tree, live
+        symbols come before deleted ones. On branches, a content that several branches hold is listed for the branch
+        with the newest commit.
+        """
         # The filters go into the SQL. Applied after the row limit, they would lose a match
         # among many same-named symbols.
         if parent:
@@ -367,26 +481,49 @@ class IndexSession:
         columns = "s.name, s.kind, s.parent, s.line, s.end_line, s.signature, b.oid, b.id"
         path_condition, path_parameters = _path_sql(path_filter)
 
-        sql = f"""
-            SELECT * FROM (
-                SELECT f.path AS path, NULL, {columns}
-                FROM symbols s JOIN blobs b ON b.id = s.blob JOIN files f ON f.blob = s.blob
-                WHERE {condition}
-                UNION ALL
-                SELECT d.path AS path, d.commit_id, {columns}
-                FROM symbols s JOIN blobs b ON b.id = s.blob JOIN deleted d ON d.blob = s.blob
-                WHERE {condition} AND d.path NOT IN (SELECT path FROM files)
-            )
-            WHERE {path_condition}
-            LIMIT {TIER_FETCH}
-        """
+        if scope == Scope.BRANCHES:
+            sql = f"""
+                SELECT * FROM (
+                    SELECT t.path AS path, NULL, t.branch, br.date AS date, {columns}
+                    FROM symbols s JOIN blobs b ON b.id = s.blob JOIN branch_files t ON t.blob = s.blob
+                    JOIN branches br ON br.name = t.branch
+                    WHERE {condition} AND NOT EXISTS (SELECT 1 FROM files f WHERE f.path = t.path AND f.blob = t.blob)
+                )
+                WHERE {path_condition}
+                ORDER BY date DESC
+                LIMIT {TIER_FETCH}
+            """
+            parameters = parameters + path_parameters
+        else:
+            sql = f"""
+                SELECT * FROM (
+                    SELECT f.path AS path, NULL, NULL, NULL, {columns}
+                    FROM symbols s JOIN blobs b ON b.id = s.blob JOIN files f ON f.blob = s.blob
+                    WHERE {condition}
+                    UNION ALL
+                    SELECT d.path AS path, d.commit_id, NULL, NULL, {columns}
+                    FROM symbols s JOIN blobs b ON b.id = s.blob JOIN deleted d ON d.blob = s.blob
+                    WHERE {condition} AND d.path NOT IN (SELECT path FROM files)
+                )
+                WHERE {path_condition}
+                LIMIT {TIER_FETCH}
+            """
+            parameters = parameters + parameters + path_parameters
 
-        return [
-            SymbolHit(Place(file_path, oid, blob, commit), name, kind, parent, line, end_line, signature)
-            for file_path, commit, name, kind, parent, line, end_line, signature, oid, blob in self._db.execute(
-                sql, parameters + parameters + path_parameters
-            )
-        ]
+        hits: list[SymbolHit] = []
+        seen: set[tuple[str, int, int]] = set()
+        for row in self._db.execute(sql, parameters):
+            file_path, commit, branch, date, *symbol, oid, blob = row
+            line = symbol[3]
+
+            # Rows on branches come newest branch first, so the first row for a content is the one to keep.
+            if branch is not None and (file_path, blob, line) in seen:
+                continue
+            seen.add((file_path, blob, line))
+            place = Place(file_path, oid, blob, commit, branch=branch, branch_date=date)
+            hits.append(SymbolHit(place, *symbol))
+
+        return hits
 
     def _ensure_schema(self) -> None:
         """Create the tables when the file is new or has an old schema version."""
@@ -398,7 +535,18 @@ class IndexSession:
             if self._schema_version() == SCHEMA_VERSION:
                 return
 
-            for name in ["blobs", "symbols", "symbol_names", "files", "deleted", "text_fts", "meta"]:
+            tables = [
+                "blobs",
+                "symbols",
+                "symbol_names",
+                "files",
+                "deleted",
+                "branches",
+                "branch_files",
+                "text_fts",
+                "meta",
+            ]
+            for name in tables:
                 self._db.execute(f"DROP TABLE IF EXISTS {name}")
 
             for statement in SCHEMA.split(";"):
@@ -421,6 +569,34 @@ def connect(path: Path) -> Generator[IndexSession]:
         yield IndexSession(db)
     finally:
         db.close()
+
+
+def _newest_per_content(places: list[Place]) -> list[Place]:
+    """
+    The first place for each path and content, in the order given. Most branches share most of their files, so one
+    content is often on many branches.
+    """
+    seen: set[tuple[str, int]] = set()
+    kept: list[Place] = []
+
+    for place in places:
+        if (place.path, place.blob_row) not in seen:
+            seen.add((place.path, place.blob_row))
+            kept.append(place)
+
+    return kept
+
+
+def age(timestamp: int) -> str:
+    """How long ago a time was, in its largest whole unit, such as "3 days ago" or "5 months ago"."""
+    seconds = max(0, int(time.time()) - timestamp)
+
+    for unit, length in [("year", 365 * 86400), ("month", 30 * 86400), ("day", 86400), ("hour", 3600), ("minute", 60)]:
+        if seconds >= length:
+            count = seconds // length
+            return f"{count} {unit} ago" if count == 1 else f"{count} {unit}s ago"
+
+    return "just now"
 
 
 def path_matches(path: str, path_filter: str | None) -> bool:

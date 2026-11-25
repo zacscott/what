@@ -59,6 +59,7 @@ The first search builds the index. `what --index` builds it up front.
 
 - Symbols come from tree-sitter. Every language the grammar pack supports gets parsed.
 - Text is in an SQLite FTS5 trigram index. The index picks the files that might match, then `what` reads only those files for the matching lines.
+- Other branches are searched when `find` or `grep` finds nothing in the working tree, or every time with `--branches`. The default branch and every branch not merged into it are searched, local and remote-tracking. A branch adds only the files it changed, and only where its version differs from the working tree. Each file version is indexed once, by its git blob id, so the index grows with the real changes and not with the number of branches.
 - Deleted files come from `git log --diff-filter=D`. Each one is indexed as it was just before the commit that removed it. They are named `COMMIT^:path`, so `git show` accepts the name.
 - Before each search, `what` asks git which files changed and re-reads only those. There is no file watcher.
 - Outside a git repository, `what` walks the directory and follows its `.gitignore` files. There are no deleted files.

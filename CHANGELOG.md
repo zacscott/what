@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- `find` and `grep` search other branches when the working tree has no match, and `--branches` searches them every time. They search the default branch and every local and remote-tracking branch that isn't merged into it. A hit is shown only where the branch's version of the file differs from the working tree, and is labelled with the branch and the age of its last commit. When remote-tracking branches were searched, the output says when they were last fetched.
+
 - `--ref <ref>` on `find`, `show` and `outline` answers at a branch, tag or commit in place of the working tree. It reads the files from git and needs no index of the ref. An unknown ref exits with an error that names it.
 
 - A qualified name with a namespace, such as `Phinx\Db\Table.addIndex`, matches the class without its namespace.

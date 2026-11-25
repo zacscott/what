@@ -17,8 +17,8 @@ SHOW_MAX_LINES = 400
 # plain text makes every file a candidate.
 COUNT_FILES = 2000
 
-# How many deleted files a text search reads from git. Each one costs a blob read.
-DELETED_FILES_READ = 100
+# How many deleted files, or files on other branches, a text search reads from git. Each one costs a blob read.
+GIT_FILES_READ = 100
 
 # How long `git log -S` may run. It reads every commit, which took 10 seconds on a 33,000 commit repository.
 COMMIT_SEARCH_SECONDS = 30

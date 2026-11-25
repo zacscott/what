@@ -29,10 +29,12 @@ examples:
   what show Banana.bend            the source of one symbol
   what grep "str_repeat("          text, each hit under the function it sits in
   what grep "bend\\w+" --regex --deleted
+  what grep "punctuate" --branches  also search unmerged branches
   what show Banana.bend --ref origin/dev   the method as it is on another branch
 """
 
 PATH_HELP = "only files whose path contains this, or matches this glob"
+BRANCHES_HELP = "also search other branches; without it they are searched only when nothing else matches"
 REF_HELP = "search the files at this branch, tag or commit in place of the working tree"
 KIND_HELP = "only this kind: class, function, method, interface, enum..."
 
@@ -74,6 +76,7 @@ def app(build_index: bool, prompt: bool) -> None:
         index = _open_index()
         index.refresh()
         index.refresh_history()
+        index.refresh_branches()
 
 
 def main() -> None:
@@ -90,15 +93,17 @@ def main() -> None:
 @click.option("--path", help=PATH_HELP)
 @click.option("--limit", default=30, show_default=True)
 @click.option("--ref", help=REF_HELP)
+@click.option("--branches", is_flag=True, help=BRANCHES_HELP)
 def lookup(
     query: tuple[str, ...],
     kind: str | None,
     path: str | None,
     limit: int,
     ref: str | None,
+    branches: bool,
 ) -> None:
     """Find a name, list what a file defines or print a line range. what runs this when no command is given."""
-    print(search.lookup(_searchable_index(), " ".join(query), kind, path, limit, ref))
+    print(search.lookup(_searchable_index(), " ".join(query), kind, path, limit, ref, branches))
 
 
 @app.command()
@@ -107,15 +112,17 @@ def lookup(
 @click.option("--path", help=PATH_HELP)
 @click.option("--limit", default=30, show_default=True)
 @click.option("--ref", help=REF_HELP)
+@click.option("--branches", is_flag=True, help=BRANCHES_HELP)
 def find(
     query: tuple[str, ...],
     kind: str | None,
     path: str | None,
     limit: int,
     ref: str | None,
+    branches: bool,
 ) -> None:
     """Find where a class, function, method, type or file is defined, by name or part of one."""
-    print(search.find(_searchable_index(), " ".join(query), kind, path, limit, ref))
+    print(search.find(_searchable_index(), " ".join(query), kind, path, limit, ref, branches))
 
 
 @app.command()
@@ -124,6 +131,7 @@ def find(
 @click.option("--path", help=PATH_HELP)
 @click.option("--deleted", is_flag=True, help="also search files deleted in git history")
 @click.option("--commits", is_flag=True, help="also list commits that added or removed the text; slow")
+@click.option("--branches", is_flag=True, help=BRANCHES_HELP)
 @click.option("--limit", default=40, show_default=True)
 def grep(
     pattern: tuple[str, ...],
@@ -131,11 +139,15 @@ def grep(
     path: str | None,
     deleted: bool,
     commits: bool,
+    branches: bool,
     limit: int,
 ) -> None:
     """Search file contents. Each hit is listed under the symbol it sits in. Case is ignored unless the pattern has a capital."""
     index = _searchable_index()
-    print(search.grep(index, " ".join(pattern), regex, path, limit, deleted=deleted, commits=commits))
+    found = search.grep(
+        index, " ".join(pattern), regex, path, limit, deleted=deleted, commits=commits, branches=branches
+    )
+    print(found)
 
 
 @app.command()
