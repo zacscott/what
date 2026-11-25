@@ -81,51 +81,78 @@ class Installed:
     notes: list[str]
 
 
-def installed(root: Path, transitive: bool) -> Installed:
+# The lockfiles that record which dependencies are instaleld.
+LOCKFILES = ["composer.lock", "package-lock.json", "uv.lock", "poetry.lock"]
+
+
+def installed(index: Index, transitive: bool) -> Installed:
     """
-    The dependencies installed at root, as its lockfiles record them. Only direct dependencies are litsed unless
-    transitive is True.
+    The dependencies installed for the repository, as its lockfiles record them. Only direct dependencies are listed
+    unless transitive is True.
     """
     packages: list[Package] = []
     notes: list[str] = []
 
-    for lockfile, command, read in [
+    readers = [
         ("composer.lock", "composer install", _composer),
         ("package-lock.json", "npm install", _npm),
         ("uv.lock", "uv sync", _python),
         ("poetry.lock", "poetry install", _python),
-    ]:
-        if not (root / lockfile).is_file():
-            continue
+    ]
 
-        found, missing = read(root, lockfile)
-        packages.extend(package for package in found if transitive or package.direct)
+    for folder in project_folders(index):
+        for lockfile, command, read in readers:
+            path = index.root / folder / lockfile
+            if not path.is_file():
+                continue
 
-        if lockfile == "package-lock.json" and "packages" not in _json(root / lockfile):
-            notes.append(
-                "package-lock.json is lockfile version 1, which isn't read; run npm install with npm 7 or later"
-            )
+            found, missing = read(path.parent, lockfile)
+            packages.extend(package for package in found if transitive or package.direct)
 
-        missing = [name for name, direct in missing if transitive or direct]
-        if missing:
-            count = "1 package" if len(missing) == 1 else f"{len(missing)} packages"
-            verb = "isn't" if len(missing) == 1 else "aren't"
-            notes.append(f"{count} in {lockfile} {verb} installed; run {command}")
+            if lockfile == "package-lock.json" and "packages" not in _json(path):
+                notes.append(f"{folder}{lockfile} is lockfile version 1, which isn't read; run npm install with npm 7")
+
+            missing = [name for name, direct in missing if transitive or direct]
+            if missing:
+                count = "1 package" if len(missing) == 1 else f"{len(missing)} packages"
+                verb = "isn't" if len(missing) == 1 else "aren't"
+                notes.append(f"{count} in {folder}{lockfile} {verb} installed; run {command}")
 
     return Installed(packages, notes)
 
 
-def dependency_folders(root: Path) -> list[str]:
+def project_folders(index: Index) -> list[str]:
     """
-    The folders, relative to root, that hold installed dependencies rather than the repository's own code, such as
-    "vendor/", "node_modules/" and ".venv/".
+    The folders that hold a lockfile, relative to the root and ending in "/", with "" for the root itself. A
+    repository can keep its PHP dependencies in a subfolder, such as "include/". The root is always listed, because
+    a lockfile there is often ignored by git and so not in the index.
     """
-    folders = ["vendor/", "node_modules/"]
-    site = _site_packages(root)
-    if site is not None and site.is_relative_to(root):
-        folders.append(site.relative_to(root).parts[0] + "/")
+    folders = {""}
 
-    return folders
+    with index.connect() as session:
+        for lockfile in LOCKFILES:
+            for place in session.places_ending_with(lockfile):
+                is_dependency = "vendor/" in place.path or "node_modules/" in place.path
+                if place.in_working_tree and not is_dependency:
+                    folders.add(place.path.removesuffix(lockfile))
+
+    return sorted(folders)
+
+
+def dependency_folders(index: Index) -> list[str]:
+    """
+    The folders, relative to the root, that hold installed dependencies rather than the repository's own code, such
+    as "vendor/", "include/vendor/", "node_modules/" and ".venv/".
+    """
+    found: list[str] = []
+
+    for folder in project_folders(index):
+        found.extend([f"{folder}vendor/", f"{folder}node_modules/"])
+        site = _site_packages(index.root / folder)
+        if site is not None and site.is_relative_to(index.root):
+            found.append(site.relative_to(index.root).parts[0] + "/")
+
+    return found
 
 
 def package_rows(index: Index, packages: list[Package]) -> dict[int, Package]:

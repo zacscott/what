@@ -81,7 +81,7 @@ def app(build_index: bool, prompt: bool) -> None:
         index.refresh()
         index.refresh_history()
         index.refresh_branches()
-        dependencies.package_rows(index, dependencies.installed(index.root, False).packages)
+        dependencies.package_rows(index, dependencies.installed(index, False).packages)
 
 
 def main() -> None:

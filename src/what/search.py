@@ -4,7 +4,7 @@ a path printed once, with its matches under it as "line: text".
 """
 
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
@@ -133,11 +133,15 @@ def _find(
 
     parent, name = _split_qualified("".join(words))
 
+    in_dependencies = _in_dependencies(index)
     with index.connect() as session:
         hits = _find_symbols(session, name, words, parent, kind, path)
         paths = [] if kind else _find_paths(session, words, path)
         if not hits and not paths:
             hits, paths = _find_abbreviated(session, name, parent, kind, path)
+
+    hits = [hit for hit in hits if not in_dependencies(hit.place.path)]
+    paths = [place for place in paths if not in_dependencies(place.path)]
 
     here = _found_lines(hits, paths, limit) if hits or paths else []
     elsewhere: list[str] = []
@@ -176,7 +180,7 @@ def _dependency_symbols(
     Symbols in the installed dependencies that match a name, in the tiers find ranks, and a note for each lockfile
     with packages that aren't installed.
     """
-    installed = dependencies.installed(index.root, deps == DependencyReach.ALL)
+    installed = dependencies.installed(index, deps == DependencyReach.ALL)
     packages = dependencies.package_rows(index, installed.packages)
     if not packages:
         return [], installed.notes
@@ -334,7 +338,7 @@ def grep(
 
     notes: list[str] = []
     if deps != DependencyReach.FALLBACK:
-        installed = dependencies.installed(index.root, deps == DependencyReach.ALL)
+        installed = dependencies.installed(index, deps == DependencyReach.ALL)
         packages = dependencies.package_rows(index, installed.packages)
         places = [place for place in dependencies.source_places(index, packages) if path_matches(place.path, path)]
         with index.connect() as session:
@@ -433,15 +437,13 @@ def _text_search(
     matcher, literals = _matcher(pattern, regex)
 
     # Installed dependencies would bury the repository's own code. grep reads them only when asked to.
-    skipped = tuple(dependencies.dependency_folders(index.root))
+    in_dependencies = _in_dependencies(index)
 
     with index.connect() as session:
         live = [
             place
             for place in session.live_places_with_text(literals)
-            if path_matches(place.path, path)
-            and not place.path.startswith(skipped)
-            and "/node_modules/" not in place.path
+            if path_matches(place.path, path) and not in_dependencies(place.path)
         ]
         texts = ((place, index.read_live(place.path)) for place in live)
 
@@ -458,6 +460,15 @@ def _text_search(
         found.add(_matching_lines(session, _git_texts(index, gone), matcher, limit, len(gone)))
 
     return found
+
+
+def _in_dependencies(index: Index) -> Callable[[str], bool]:
+    """
+    A test for whether a path in the working tree is inside a folder of installed dependencies, such as vendor/.
+    Searches leave those out, even when they are committed, so dependency code is never shown as the repository's.
+    """
+    folders = tuple(dependencies.dependency_folders(index))
+    return lambda path: path.startswith(folders) or "/node_modules/" in path
 
 
 def _matcher(pattern: str, regex: bool) -> tuple[re.Pattern[str], list[str]]:
@@ -511,7 +522,12 @@ def callers(
 
         matcher = re.compile(rf"(?<![\w$]){re.escape(name)}(?!\w)")
         literals = [name] if len(name) >= 3 else []
-        live = [place for place in session.live_places_with_text(literals) if path_matches(place.path, path)]
+        in_dependencies = _in_dependencies(index)
+        live = [
+            place
+            for place in session.live_places_with_text(literals)
+            if path_matches(place.path, path) and not in_dependencies(place.path)
+        ]
 
         found = TextMatches([])
         for read, place in enumerate(live):
@@ -692,6 +708,7 @@ def _show(
     path: str | None,
     deps: DependencyReach,
 ) -> str:
+    in_dependencies = _in_dependencies(index)
     with index.connect() as session:
         line_range = LINE_RANGE.fullmatch(target)
         places = _resolve_path(session, line_range.group(1) if line_range else target)
@@ -706,7 +723,9 @@ def _show(
 
         parent, name = _split_qualified(target)
         hits = [
-            hit for hit in _find_symbols(session, name, [name], parent, None, path) if hit.name.lower() == name.lower()
+            hit
+            for hit in _find_symbols(session, name, [name], parent, None, path)
+            if hit.name.lower() == name.lower() and not in_dependencies(hit.place.path)
         ]
 
     notes: list[str] = []

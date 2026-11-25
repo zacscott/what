@@ -220,3 +220,16 @@ def test_an_optional_npm_package_that_is_not_installed_gets_no_note(index: Index
     )
 
     assert "package-lock.json" not in search.find(index, "nothing_is_called_this")
+
+
+def test_a_lockfile_in_a_subfolder_is_read_and_its_vendor_left_out_of_grep(index: Index, repo: Path) -> None:
+    (repo / "include").mkdir()
+    install_composer(repo / "include", {"robmorgan/phinx": "0.16.1"}, ["robmorgan/phinx"])
+    (repo / "include/.gitignore").unlink()
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "Commit a PHP project in a subfolder, vendor included")
+
+    assert search.find(index, "addIndex").splitlines() == [
+        "vendor: robmorgan/phinx@0.16.1 src/Phinx/Db/Table.php:5:public function addIndex($columns, array $options = [])",
+    ]
+    assert search.grep(index, "version 0.16.1").startswith("No text matches")
