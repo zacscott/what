@@ -3,9 +3,12 @@
 import subprocess
 from pathlib import Path
 
+import pytest
 from conftest import BENDER, git
 
+from what import git as git_module
 from what import search
+from what.config import settings
 from what.index import Index
 
 
@@ -128,3 +131,70 @@ def test_remote_branches_are_searched_and_say_when_they_were_fetched(repo: Path,
 
     git(clone, "fetch", "-q")
     assert search.find(index, "peel_banana").splitlines()[-1] == "remotes fetched just now"
+
+
+def test_a_remote_head_that_names_a_deleted_branch_is_passed_over(repo: Path, tmp_path: Path) -> None:
+    git(repo, "checkout", "-q", "-b", "feature/peel")
+    commit_file(repo, "src/peel.py", "def peel_banana():\n    pass\n", "Peel")
+    git(repo, "checkout", "-q", "main")
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(repo), str(clone)], check=True, capture_output=True)
+    git(repo, "branch", "-q", "-m", "main", "trunk")
+    git(clone, "fetch", "-q", "--prune")
+
+    output = search.find(Index(clone, cache_dir=tmp_path / "clone-cache"), "peel_banana")
+
+    assert "origin/feature/peel (just now) src/peel.py:1:def peel_banana():" in output
+
+
+def test_many_moved_branches_are_read_in_the_background(
+    index: Index,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git(repo, "checkout", "-q", "-b", "feature/peel")
+    commit_file(repo, "src/peel.py", "def peel_banana():\n    pass\n", "Peel")
+    git(repo, "checkout", "-q", "main")
+    started: list[Index] = []
+
+    def start(self: Index) -> None:
+        started.append(self)
+
+    monkeypatch.setattr(settings, "BRANCHES_READ_INLINE", 0)
+    monkeypatch.setattr(Index, "build_in_background", start)
+
+    output = search.find(index, "peel_banana")
+
+    assert output.splitlines() == [
+        "Nothing named or containing 'peel_banana' in live or deleted files, other branches or dependencies.",
+        search.BRANCHES_BUILDING.format(count=1),
+    ]
+    assert search.grep(index, "peel_banana").splitlines() == [
+        "No text matches for 'peel_banana' in live or deleted files or on other branches.",
+        search.BRANCHES_BUILDING.format(count=1),
+    ]
+    assert started == [index, index]
+
+
+def test_moving_head_reads_only_the_default_branch_again(
+    index: Index,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git(repo, "checkout", "-q", "-b", "feature/peel")
+    commit_file(repo, "src/peel.py", "def peel_banana():\n    pass\n", "Peel")
+    git(repo, "checkout", "-q", "-b", "work", "main")
+    index.refresh_branches()
+    read: list[str] = []
+    original = git_module.changed_files
+
+    def changed_files(root: Path, base: str, tip: str) -> dict[str, str]:
+        read.append(tip)
+        return original(root, base, tip)
+
+    monkeypatch.setattr(git_module, "changed_files", changed_files)
+
+    commit_file(repo, "src/work.py", "def work():\n    pass\n", "Work")
+    index.refresh_branches()
+
+    assert read == [git_module.commit_of(repo, "main")]

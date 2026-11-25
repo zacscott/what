@@ -30,6 +30,7 @@ LINE_RANGE = re.compile(r"(.+?):(\d+)(?:-(\d+))?")
 DELETED_REF = re.compile(r"([0-9a-f]{4,40})\^:(.+)")
 
 HISTORY_BUILDING = "(The index of deleted files is not up to date, so deleted files may be missing.)"
+BRANCHES_BUILDING = "(The index of other branches is not up to date, so {count} branches may be missing.)"
 
 # Ends a grep hit on the line that definse the symbol, so the definition stands out from the call sites.
 DEFINITION_MARK = "  [definition]"
@@ -139,14 +140,15 @@ def _find(
             hits, paths = _find_abbreviated(session, name, parent, kind, path)
 
     here = _found_lines(hits, paths, limit) if hits or paths else []
-    elsewhere = (
-        _find_on_branches(index, name, words, parent, kind, path, limit, bool(here)) if branches or not here else []
-    )
-
+    elsewhere: list[str] = []
     notes: list[str] = []
+    if branches or not here:
+        elsewhere, notes = _find_on_branches(index, name, words, parent, kind, path, limit, bool(here))
+
     if deps != DependencyReach.FALLBACK or not here:
-        package_hits, notes = _dependency_symbols(index, name, words, parent, kind, deps)
+        package_hits, package_notes = _dependency_symbols(index, name, words, parent, kind, deps)
         elsewhere += _found_lines(_ranked(package_hits), [], limit)
+        notes += package_notes
 
     if here or elsewhere:
         return "\n".join(here + elsewhere + notes)
@@ -191,25 +193,38 @@ def _find_on_branches(
     path: str | None,
     limit: int,
     found_here: bool,
-) -> list[str]:
-    """The output of find on other branches, empty when no branch has a match that the working tree lacks."""
-    branches = index.refresh_branches()
+) -> tuple[list[str], list[str]]:
+    """
+    The output of find on other branches, empty when no branch has a match that the working tree lacks, and a note
+    when some branches aren't indexed yet.
+    """
+    branches, notes = _read_branches(index)
     if not branches:
-        return []
+        return [], notes
 
     with index.connect() as session:
         hits = _find_symbols(session, name, words, parent, kind, path, Scope.BRANCHES)
         paths = [] if kind else _find_paths(session, words, path, Scope.BRANCHES)
 
     if not hits and not paths:
-        return []
+        return [], notes
 
     places = [hit.place for hit in hits[:limit]] + paths
-    return [
-        _branches_heading(places, found_here),
-        *_found_lines(hits, paths, limit),
-        *_fetch_note(index, branches),
-    ]
+    found = [_branches_heading(places, found_here), *_found_lines(hits, paths, limit), *_fetch_note(index, branches)]
+    return found, notes
+
+
+def _read_branches(index: Index) -> tuple[list[git.Branch], list[str]]:
+    """
+    The other branches, after reading the ones that moved. When too many moved for a search to wait on, a process
+    in the background reads them, and the note says some branches may be missing.
+    """
+    branches, pending = index.refresh_branches(settings.BRANCHES_READ_INLINE)
+    if not pending:
+        return branches, []
+
+    index.build_in_background()
+    return branches, [BRANCHES_BUILDING.format(count=pending)]
 
 
 def _branches_heading(places: list[Place], found_here: bool) -> str:
@@ -233,7 +248,11 @@ def _fetch_note(index: Index, branches: list[git.Branch]) -> list[str]:
     return [f"remotes fetched {age(int(fetched))}"]
 
 
-def _found_lines(hits: list[SymbolHit], paths: list[Place], limit: int) -> list[str]:
+def _found_lines(
+    hits: list[SymbolHit],
+    paths: list[Place],
+    limit: int,
+) -> list[str]:
     """The output of find: symbol hits grouped by file, then the files whose path matched."""
     output: list[str] = []
     shown = hits[:limit]
@@ -326,16 +345,17 @@ def grep(
 
     output = [found.summary(), *found.lines] if found.lines else []
     if branches or not found.lines:
-        output.extend(_grep_on_branches(index, pattern, regex, path, limit, bool(found.lines)))
+        on_branches, branch_notes = _grep_on_branches(index, pattern, regex, path, limit, bool(found.lines))
+        output.extend(on_branches)
+        notes.extend(branch_notes)
     if commits:
         output.extend(_commits_changing(index, pattern))
-    output.extend(notes)
+    if not output:
+        output.append(f"No text matches for {pattern!r} in live or deleted files or on other branches.")
 
     # Only a search of deleted files can miss what the unfinished history build hasn't read yet.
     note = _history_note(index) if deleted else ""
-    if not output:
-        return f"No text matches for {pattern!r} in live or deleted files or on other branches." + note
-    return "\n".join(output) + note
+    return "\n".join([*output, *notes]) + note
 
 
 def _grep_on_branches(
@@ -345,11 +365,14 @@ def _grep_on_branches(
     path: str | None,
     limit: int,
     found_here: bool,
-) -> list[str]:
-    """The output of grep on other branches, empty when no branch has a match that the working tree lacks."""
-    branches = index.refresh_branches()
+) -> tuple[list[str], list[str]]:
+    """
+    The output of grep on other branches, empty when no branch has a match that the working tree lacks, and a note
+    when some branches aren't indexed yet.
+    """
+    branches, notes = _read_branches(index)
     if not branches:
-        return []
+        return [], notes
 
     matcher, literals = _matcher(pattern, regex)
     with index.connect() as session:
@@ -357,8 +380,9 @@ def _grep_on_branches(
         found = _matching_lines(session, _git_texts(index, places), matcher, limit, len(places))
 
     if not found.lines:
-        return []
-    return [_branches_heading(found.places, found_here), found.summary(), *found.lines, *_fetch_note(index, branches)]
+        return [], notes
+    heading = _branches_heading(found.places, found_here)
+    return [heading, found.summary(), *found.lines, *_fetch_note(index, branches)], notes
 
 
 @dataclass
@@ -378,6 +402,7 @@ class TextMatches:
     unread: int = 0
 
     def add(self, other: "TextMatches") -> None:
+        """Add another search's lines and counts to this one's."""
         self.lines.extend(other.lines)
         self.places.extend(other.places)
         self.shown += other.shown
@@ -489,14 +514,18 @@ def callers(
         live = [place for place in session.live_places_with_text(literals) if path_matches(place.path, path)]
 
         found = TextMatches([])
-        for place in live:
+        for read, place in enumerate(live):
+            # Once the limit is shown, the files after it are read only to count their calls, up to a point.
+            if found.shown >= limit and read >= settings.COUNT_FILES:
+                found.unread = len(live) - read
+                break
+
             text = index.read_live(place.path)
             if text is None:
                 continue
 
-            calls = _calls_in(
-                place.path, text, matcher, definitions, owner, is_member, session.symbols_in_blob(place.blob_row)
-            )
+            symbols = session.symbols_in_blob(place.blob_row)
+            calls = _calls_in(place.path, text, matcher, definitions, owner, is_member, symbols)
             if not calls:
                 continue
 
@@ -505,7 +534,6 @@ def callers(
             if found.shown < limit:
                 shown = calls[: limit - found.shown]
                 marks = {number: POSSIBLE_MARK for number, _, certain in shown if not certain}
-                symbols = session.symbols_in_blob(place.blob_row)
                 found.lines.extend(_lines_under_symbols(place.ref, symbols, [(n, line) for n, line, _ in shown], marks))
                 found.shown += len(shown)
 
@@ -586,7 +614,11 @@ def _call_certainty(
     return False
 
 
-def outline(index: Index, path: str, ref: str | None = None) -> str:
+def outline(
+    index: Index,
+    path: str,
+    ref: str | None = None,
+) -> str:
     """Every symbol in one file with its line range, indented by nesting. With a ref, the file is read at that ref."""
     if ref is not None:
         return _outline_at_ref(index, path, ref)
@@ -605,7 +637,11 @@ def _outline(index: Index, path: str) -> str:
     return _outline_lines(places[0], symbols)
 
 
-def _outline_at_ref(index: Index, path: str, ref: str) -> str:
+def _outline_at_ref(
+    index: Index,
+    path: str,
+    ref: str,
+) -> str:
     places = _resolve_tree_path(_tree_at(index, ref)[1], ref, path)
     if len(places) != 1:
         return _path_choices(path, places)
@@ -972,7 +1008,11 @@ def _matching_lines(
     return found
 
 
-def _is_defined_by(symbol: SymbolHit, matches: list[tuple[int, str]], matcher: re.Pattern[str]) -> bool:
+def _is_defined_by(
+    symbol: SymbolHit,
+    matches: list[tuple[int, str]],
+    matcher: re.Pattern[str],
+) -> bool:
     """
     True when a matching line is where the symbol is defined, and the match is about the symbol: the pattern matches
     its name, as "bandana" doies, or the matched text holds its name, as "function bandana" does.
@@ -1053,7 +1093,11 @@ def _tree_at(index: Index, ref: str) -> tuple[str, dict[str, str]]:
     return commit, git.files_at(index.root, commit)
 
 
-def _resolve_tree_path(tree: dict[str, str], ref: str, path: str) -> list[Place]:
+def _resolve_tree_path(
+    tree: dict[str, str],
+    ref: str,
+    path: str,
+) -> list[Place]:
     """The file a path names at a rf, the way _resolve_path finds it in the working tree."""
     path = path.removeprefix(ref + ":").removeprefix("./")
     if path in tree:
@@ -1087,13 +1131,17 @@ def _symbols_at(
 ) -> list[SymbolHit]:
     """
     Every symbol in the files at a ref that contain text. git grep picks those files, so a search
-    parses only them and needs no index of the ref.
+    parses only them and needs no index of the ref. Only the first settings.GIT_FILES_READ are parsed,
+    shortest path first, so a common word can't make one search parse the whole tree.
     """
-    places = [
-        Place(path, tree[path], 0, tree=ref)
-        for path in git.paths_containing(index.root, commit, text)
-        if path in tree and path_matches(path, path_filter)
-    ]
+    places = sorted(
+        (
+            Place(path, tree[path], 0, tree=ref)
+            for path in git.paths_containing(index.root, commit, text)
+            if path in tree and path_matches(path, path_filter)
+        ),
+        key=lambda place: len(place.path),
+    )[: settings.GIT_FILES_READ]
     hits: list[SymbolHit] = []
 
     for place, (_, content) in zip(places, git.read_blobs(index.root, [place.oid for place in places])):

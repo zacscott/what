@@ -376,6 +376,15 @@ def test_find_at_a_ref_finds_a_definition_that_was_deleted_later(index: Index) -
     )
 
 
+def test_find_at_a_ref_finds_a_class_that_was_deleted_later(index: Index, repo: Path) -> None:
+    git(repo, "rm", "-q", "src/BananaBender.php")
+    git(repo, "commit", "-q", "-m", "Remove the bender")
+
+    assert search.find(index, "BananaBender", kind="class", ref="HEAD~1").splitlines() == [
+        "HEAD~1:src/BananaBender.php:2:class BananaBender extends Lady",
+    ]
+
+
 def test_outline_at_a_ref_reads_the_file_from_git(index: Index) -> None:
     assert search.outline(index, "split.py", ref="HEAD~1").splitlines() == [
         "HEAD~1:legacy/split.py",

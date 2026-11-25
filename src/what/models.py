@@ -1,6 +1,6 @@
 """
-The tables of the index, one open connection to them, and the SQL that reads and writes them. No other
-module holds SQL.
+The tables of the index of one repository, and of the dependency index that every repository shares, one open
+connection to each, and the SQL that reads and writes them. No other module holds SQL.
 
 A row in blobs is one file content, keyed on git's blob id. The files table
 says which content each path holds now. The deleted table says which content
@@ -13,7 +13,7 @@ import fnmatch
 import re
 import sqlite3
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +21,7 @@ from pathlib import Path
 from what.symbols import Symbol
 
 # Changing the tables means raising this. An index with another version is rebuilt from nothing.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # How many rows one tier of a symbol search fetches before ranking.
 TIER_FETCH = 300
@@ -57,8 +57,9 @@ CREATE TABLE deleted (
     date TEXT NOT NULL
 );
 CREATE INDEX deleted_blob ON deleted (blob);
--- The branches whose files are indexed. tip is the commit the branch pointed at, and head is the commit HEAD pointed
--- at, when its files were listed. date is the time of the tip commit, in seconds since 1970.
+-- The branches whose files are indexed. tip is the commit the branch pointed at when its files were listed. head is
+-- the commit HEAD pointed at then, for the default branch, and empty for the others. date is the time of the tip
+-- commit, in seconds since 1970.
 CREATE TABLE branches (
     name TEXT PRIMARY KEY,
     tip TEXT NOT NULL,
@@ -293,9 +294,7 @@ class IndexSession(_Session):
             """
             rows = self._db.execute(sql, (match,))
 
-        return _newest_per_content(
-            [Place(path, oid, blob, branch=branch, branch_date=date) for path, oid, blob, branch, date in rows]
-        )
+        return _branch_places(rows)
 
     def symbols_named(
         self,
@@ -485,7 +484,12 @@ class IndexSession(_Session):
         """Record a value the index keeps about itself."""
         self._db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
 
-    def _places_where(self, condition: str, parameters: list[str], scope: Scope) -> list[Place]:
+    def _places_where(
+        self,
+        condition: str,
+        parameters: list[str],
+        scope: Scope,
+    ) -> list[Place]:
         """
         Files matching a condition on path. A path that exists now is never also listed as deleted, or as on
         another branch.
@@ -497,10 +501,7 @@ class IndexSession(_Session):
                 WHERE {condition} AND t.path NOT IN (SELECT path FROM files)
                 ORDER BY br.date DESC
             """
-            rows = self._db.execute(sql, parameters)
-            return _newest_per_content(
-                [Place(path, oid, blob, branch=branch, branch_date=date) for path, oid, blob, branch, date in rows]
-            )
+            return _branch_places(self._db.execute(sql, parameters))
 
         sql = f"""
             SELECT f.path, b.oid, b.id, NULL FROM files f JOIN blobs b ON b.id = f.blob WHERE {condition}
@@ -731,6 +732,10 @@ def connect_dependencies(path: Path) -> Generator[DependencySession]:
 
 @contextmanager
 def _open(path: Path) -> Generator[sqlite3.Connection]:
+    """
+    Open an SQLite file in write-ahead mode, so searches can read while another process writes. Waits up to a
+    minute for a lock.
+    """
     db = sqlite3.connect(path, timeout=60, isolation_level=None)
     try:
         db.execute("PRAGMA journal_mode=WAL")
@@ -738,6 +743,13 @@ def _open(path: Path) -> Generator[sqlite3.Connection]:
         yield db
     finally:
         db.close()
+
+
+def _branch_places(rows: Iterable[tuple[str, str, int, str, int]]) -> list[Place]:
+    """Places on other branches from rows of (path, blob id, blob row, branch, date), one for each content."""
+    return _newest_per_content(
+        [Place(path, oid, blob, branch=branch, branch_date=date) for path, oid, blob, branch, date in rows]
+    )
 
 
 def _newest_per_content(places: list[Place]) -> list[Place]:

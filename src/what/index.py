@@ -8,6 +8,8 @@ import fnmatch
 import hashlib
 import os
 import stat as stat_modes
+import subprocess
+import sys
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
@@ -98,7 +100,7 @@ class Index:
 
         current = git.head(self.root)
 
-        with self.connect() as session, self._history_lock() as locked:
+        with self.connect() as session, self._lock("history") as locked:
             done = session.meta("history_head")
             if not locked or current is None or current == done:
                 return
@@ -120,37 +122,63 @@ class Index:
             session.delete_unused_blobs()
             session.set_meta("history_head", current)
 
-    def refresh_branches(self) -> list[git.Branch]:
+    def refresh_branches(self, most: int | None = None) -> tuple[list[git.Branch], int]:
         """
-        Index the files that each other branch changes, and return the branches. A branch is read again only when
-        it or HEAD has moved since it was last read.
+        Index the files that each other branch changes. Returns the branches, and how many of them are still to be
+        read. When more than most branches have moved, none are read here, so a search doesn't wait minutes on a
+        repository with a thousand branches.
 
-        The default branch is compared with HEAD, so it shows what HEAD lacks. Every other branch is compared with
-        where it split from HEAD, so it shows only that branch's own work.
+        The default branch is compared with HEAD, so it shows what HEAD lacks, and is read again whenever HEAD moves.
+        Every other branch is compared with where it split from the default branch, so it shows only its own work,
+        and is read again only when it moves.
         """
         current = git.head(self.root) if self.in_git else None
         if current is None:
-            return []
+            return [], 0
 
         branches = git.other_branches(self.root)
+        default = next((branch.tip for branch in branches if branch.is_default), None)
 
-        with self.connect() as session:
+        with self.connect() as session, self._lock("branches") as locked:
             known = session.known_branches()
-            for branch in branches:
-                if known.get(branch.name) == (branch.tip, current):
-                    continue
+            stale = [
+                branch for branch in branches if known.get(branch.name) != (branch.tip, _base_key(branch, current))
+            ]
+            if not locked or (most is not None and len(stale) > most):
+                return branches, len(stale)
 
-                base = current if branch.is_default else git.merge_base(self.root, current, branch.tip)
+            for branch in stale:
+                base = current if branch.is_default else git.merge_base(self.root, default or current, branch.tip)
                 changed = git.changed_files(self.root, base, branch.tip) if base else {}
-                self._index_branch(session, branch, current, sorted(changed.items()))
+                self._index_branch(session, branch, _base_key(branch, current), sorted(changed.items()))
 
             gone = [name for name in known if name not in {branch.name for branch in branches}]
             if gone:
                 with session.write_transaction():
                     session.delete_branches(gone)
-            session.delete_unused_blobs()
+            if stale or gone:
+                session.delete_unused_blobs()
 
-        return branches
+        return branches, 0
+
+    def build_in_background(self) -> None:
+        """
+        Start building the whole index in a process that outlives this one, unless a build is running already.
+        Reading every deleted file, or every branch of a large repository, can take minutes, so a search never
+        waits for it.
+        """
+        if self.history_is_building() or self._is_locked("branches"):
+            return
+
+        subprocess.Popen(
+            [sys.executable, "-m", "what", "--index"],
+            cwd=self.root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            # A new session keeps the build alive when the harness kills the shell that ran the search.
+            start_new_session=True,
+        )
 
     def history_is_current(self) -> bool:
         if not self.in_git:
@@ -161,8 +189,7 @@ class Index:
 
     def history_is_building(self) -> bool:
         """True when another process holds the lock that refresh_history takes."""
-        with self._history_lock() as locked:
-            return not locked
+        return self._is_locked("history")
 
     def read_live(self, path: str) -> str | None:
         """The text of a file in the working tree, or None when it is binary, too big or gone."""
@@ -259,19 +286,33 @@ class Index:
             _add_blob(session, oid, path, texts.get(oid) if _has_indexed_text(path) else None) for path, oid in files
         ]
 
+    def _is_locked(self, name: str) -> bool:
+        """True when another process holds one of the locks that _lock takes."""
+        with self._lock(name) as locked:
+            return not locked
+
     @contextmanager
-    def _history_lock(self) -> Generator[bool]:
+    def _lock(self, name: str) -> Generator[bool]:
         """
-        Yield True when this process may build the history. Several searches can
-        run at once in one repository, and only one build should read every deleted file.
+        Yield True when this process may run a long build, "history" or "branches". Several searches can
+        run at once in one repository, and only one build should read every deleted file or every branch.
         """
-        with open(self.path.with_suffix(".lock"), "w") as lock_file:
+        suffix = ".lock" if name == "history" else f".{name}.lock"
+        with open(self.path.with_suffix(suffix), "w") as lock_file:
             try:
                 fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 yield False
                 return
             yield True
+
+
+def _base_key(branch: git.Branch, head: str) -> str:
+    """
+    What a branch's listing of files depends on besides its tip: HEAD for the default branch, and nothing for the
+    others, which are compared with the default branch.
+    """
+    return head if branch.is_default else ""
 
 
 def _add_blob(session: IndexSession, oid: str, path: str, text: str | None) -> int:

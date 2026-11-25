@@ -17,6 +17,10 @@ SHOW_MAX_LINES = 400
 # leaves out. A pattern with no plain text makes every file a candidate.
 COUNT_FILES = 2000
 
+# How many moved branches a search reads itself. When mroe have moved, a process in the background reads them, and
+# the search says some branches may be missing.
+BRANCHES_READ_INLINE = 20
+
 # How many deleted files, or files on other branches, a text search reads from git. Each one costs a blob read.
 GIT_FILES_READ = 100
 

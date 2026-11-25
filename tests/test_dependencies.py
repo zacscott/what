@@ -173,3 +173,50 @@ def test_npm_and_python_packages_are_read_from_their_lockfiles(index: Index, rep
     assert search.find(index, "peel_carefully").splitlines() == [
         "site-packages: peeler@2.0 peeler/__init__.py:1:def peel_carefully():",
     ]
+
+
+def test_a_composer_package_installed_outside_vendor_is_found_where_installed_json_says(
+    index: Index,
+    repo: Path,
+) -> None:
+    install_composer(repo, {"robmorgan/phinx": "0.16.1"}, ["robmorgan/phinx"])
+    (repo / "vendor/robmorgan/phinx").rename(repo / "phinx")
+    record = json.loads((repo / "vendor/composer/installed.json").read_text())
+    record["packages"][0]["install-path"] = "../../phinx"
+    (repo / "vendor/composer/installed.json").write_text(json.dumps(record))
+    (repo / ".gitignore").write_text("vendor/\nphinx/\n")
+
+    assert search.find(index, "addIndex").splitlines() == [
+        "vendor: robmorgan/phinx@0.16.1 src/Phinx/Db/Table.php:5:public function addIndex($columns, array $options = [])",
+    ]
+
+
+def test_a_dev_branch_package_is_indexed_again_when_its_commit_changes(index: Index, repo: Path) -> None:
+    install_composer(repo, {"robmorgan/phinx": "dev-main"}, ["robmorgan/phinx"])
+    lock = json.loads((repo / "composer.lock").read_text())
+    lock["packages"][0]["source"] = {"reference": "aaa111"}
+    (repo / "composer.lock").write_text(json.dumps(lock))
+    search.find(index, "addIndex")
+
+    lock["packages"][0]["source"] = {"reference": "bbb222"}
+    (repo / "composer.lock").write_text(json.dumps(lock))
+    table = repo / "vendor/robmorgan/phinx/src/Phinx/Db/Table.php"
+    table.write_text(table.read_text().replace("addIndex", "addKey"))
+
+    assert search.find(index, "addKey").startswith("vendor: robmorgan/phinx@dev-main src/Phinx/Db/Table.php:5:")
+
+
+def test_an_optional_npm_package_that_is_not_installed_gets_no_note(index: Index, repo: Path) -> None:
+    (repo / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"optionalDependencies": {"fsevents": "^2"}},
+                    "node_modules/fsevents": {"version": "2.3.3", "optional": True},
+                },
+            }
+        )
+    )
+
+    assert "package-lock.json" not in search.find(index, "nothing_is_called_this")

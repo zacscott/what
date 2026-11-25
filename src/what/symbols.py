@@ -94,12 +94,19 @@ def extract(path: str, text: str) -> list[Symbol]:
     return sorted(found.values(), key=lambda symbol: (symbol.line, -symbol.end_line))
 
 
-def text_roles(path: str, text: str, positions: list[tuple[int, int]]) -> list[str]:
+def text_roles(
+    path: str,
+    text: str,
+    positions: list[tuple[int, int]],
+) -> list[str]:
     """
     What each position in a file sits in: "comment", "string" or "code". A position is (line, column), both counted
     from 1 and in characters. A string that is a statement on its own, suh as a Python docstring, counts as a comment.
     Every position is "code" when the language can't be parsed.
     """
+    if not positions:
+        return []
+
     import tree_sitter_language_pack as grammars
 
     language = grammars.detect_language_from_path(path)

@@ -122,7 +122,11 @@ def files_at(root: Path, commit: str) -> dict[str, str]:
     return files
 
 
-def paths_containing(root: Path, commit: str, text: str) -> list[str]:
+def paths_containing(
+    root: Path,
+    commit: str,
+    text: str,
+) -> list[str]:
     """The text files at a commit tjat contain text, ignoring case."""
     try:
         output = run(root, "grep", "-l", "-z", "-I", "-i", "-F", "-e", text, commit)
@@ -165,8 +169,9 @@ def default_branch(root: Path) -> str | None:
     The full name of the branch that work merges into, such as "refs/remotes/origin/main". The remote's HEAD
     decides it when there is one. Without a remote, it is init.defaultBranch, main or master, whichever exists.
     """
+    # origin/HEAD can name a branch the remote has since deleted or renamed, because fetch doesnt update it.
     remote_head = _optional(root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
-    if remote_head:
+    if remote_head and _optional(root, "rev-parse", "--verify", "--quiet", remote_head):
         return remote_head
 
     configured = _optional(root, "config", "init.defaultBranch")
@@ -177,12 +182,20 @@ def default_branch(root: Path) -> str | None:
     return None
 
 
-def merge_base(root: Path, first: str, second: str) -> str | None:
+def merge_base(
+    root: Path,
+    first: str,
+    second: str,
+) -> str | None:
     """The newest commit that both commits have in their history, or None when they share none."""
     return _optional(root, "merge-base", first, second)
 
 
-def changed_files(root: Path, base: str, tip: str) -> dict[str, str]:
+def changed_files(
+    root: Path,
+    base: str,
+    tip: str,
+) -> dict[str, str]:
     """The files that tip adds or changes compared with base, with their blob ids at tip. Deleted files are left out."""
     files: dict[str, str] = {}
     entries = _split(run(root, "diff-tree", "-r", "-z", "--no-renames", "--raw", "--no-abbrev", base, tip))

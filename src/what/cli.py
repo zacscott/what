@@ -1,7 +1,6 @@
 """The command line. A coding harness runs these commands through its shell."""
 
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -225,19 +224,6 @@ def _searchable_index() -> Index:
 
 
 def _start_history_build(index: Index) -> None:
-    """
-    Start indexing the deleted files in a process that outlives this one.
-    Reading every deleted file can take a minute, so a search never waits for it.
-    """
-    if index.history_is_current() or index.history_is_building():
-        return
-
-    subprocess.Popen(
-        [sys.executable, "-m", "what", "--index"],
-        cwd=index.root,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        # A new session keeps the build alive when the harness kills the shell that ran the search.
-        start_new_session=True,
-    )
+    """Start indexing the deleted files in another process when that index is out of date."""
+    if not index.history_is_current():
+        index.build_in_background()

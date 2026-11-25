@@ -43,18 +43,26 @@ class Package:
     One installed dependency. folder holds its files. files lists the paths of its source files, relative to
     folder, when the package manager records them. Otherwise folder is walked. For example:
 
-        Package("composer", "robmorgan/phinx", "0.16.1", "vendor", Path("/repo/vendor/robmorgan/phinx"), None, True)
+        Package("composer", "robmorgan/phinx", "0.16.1", "", "vendor", Path("/repo/vendor/robmorgan/phinx"), None, True)
     """
 
     ecosystem: str
     name: str
     version: str
+    # What pins the content beyond the version, such as the commit of a Composer "dev-main" package. Empty when the
+    # version alone does.
+    pin: str
     # Where the package manager installs, as the start of each hit's label: "vendor", "node_modules" or
     # "site-packages".
     location: str
     folder: Path
     files: tuple[str, ...] | None
     direct: bool
+
+    @property
+    def cache_version(self) -> str:
+        """The version the shared index keys the package on, with its pin when it has one, such as "dev-main#a1b2c3"."""
+        return f"{self.version}#{self.pin}" if self.pin else self.version
 
     @property
     def label(self) -> str:
@@ -93,6 +101,11 @@ def installed(root: Path, transitive: bool) -> Installed:
         found, missing = read(root, lockfile)
         packages.extend(package for package in found if transitive or package.direct)
 
+        if lockfile == "package-lock.json" and "packages" not in _json(root / lockfile):
+            notes.append(
+                "package-lock.json is lockfile version 1, which isn't read; run npm install with npm 7 or later"
+            )
+
         missing = [name for name, direct in missing if transitive or direct]
         if missing:
             count = "1 package" if len(missing) == 1 else f"{len(missing)} packages"
@@ -124,14 +137,14 @@ def package_rows(index: Index, packages: list[Package]) -> dict[int, Package]:
 
     with models.connect_dependencies(_index_path(index)) as session:
         for package in packages:
-            row = session.package_row(package.ecosystem, package.name, package.version)
+            row = session.package_row(package.ecosystem, package.name, package.cache_version)
             if row is None:
                 files = {path: extract(path, text) for path, text in _source_files(index, package)}
                 with session.write_transaction():
                     # Another process may have indexed the package while this one read it.
-                    row = session.package_row(package.ecosystem, package.name, package.version)
+                    row = session.package_row(package.ecosystem, package.name, package.cache_version)
                     if row is None:
-                        row = session.insert_package(package.ecosystem, package.name, package.version, files)
+                        row = session.insert_package(package.ecosystem, package.name, package.cache_version, files)
             rows[row] = package
 
     return rows
@@ -218,17 +231,30 @@ def _composer(root: Path, lockfile: str) -> tuple[list[Package], list[tuple[str,
     # Composer 2 writes {"packages": [...]} to installed.json, and Composer 1 writes the list on its own.
     record = _json(root / "vendor/composer/installed.json")
     listed = cast(list[dict[str, str]], record if isinstance(record, list) else record.get("packages", []))
-    versions = {entry["name"]: entry.get("version") for entry in listed}
+    installs = {entry["name"]: entry for entry in listed}
 
     found: list[Package] = []
     missing: list[tuple[str, bool]] = []
     for entry in [*lock.get("packages", []), *lock.get("packages-dev", [])]:
         name, version = entry["name"], entry["version"]
-        folder = root / "vendor" / name
-        if versions.get(name) != version or not folder.is_dir():
+        if entry.get("type") == "metapackage" or entry.get("dist", {}).get("type") == "path":
+            # A metapackage has no files. A path package is the project's own code, which can change under one version.
+            continue
+
+        install = installs.get(name, {})
+        # Custom installers put some packages outside vendor/, such as Drupal modules. installed.json says where,
+        # relative to vendor/composer.
+        folder = (
+            (root / "vendor/composer" / install["install-path"])
+            if "install-path" in install
+            else root / "vendor" / name
+        )
+        if install.get("version") != version or not folder.is_dir():
             missing.append((name, name in direct))
             continue
-        found.append(Package("composer", name, version, "vendor", folder, None, name in direct))
+
+        pin = entry.get("source", {}).get("reference") or entry.get("dist", {}).get("reference") or ""
+        found.append(Package("composer", name, version, pin, "vendor", folder.resolve(), None, name in direct))
 
     return found, missing
 
@@ -253,9 +279,13 @@ def _npm(root: Path, lockfile: str) -> tuple[list[Package], list[tuple[str, bool
         is_direct = key == f"node_modules/{name}" and name in direct
         folder = root / key
         if _json(folder / "package.json").get("version") != entry["version"]:
-            missing.append((name, is_direct))
+            # An optional package is often for another platform, such as fsevents on Linux, so its absence is normal.
+            if not entry.get("optional"):
+                missing.append((name, is_direct))
             continue
-        found.append(Package("npm", name, entry["version"], "node_modules", folder, None, is_direct))
+
+        pin = entry.get("integrity") or entry.get("resolved") or ""
+        found.append(Package("npm", name, entry["version"], pin, "node_modules", folder, None, is_direct))
 
     return found, missing
 
@@ -272,21 +302,33 @@ def _python(root: Path, lockfile: str) -> tuple[list[Package], list[tuple[str, b
     site = _site_packages(root)
     installs = _distributions(site) if site is not None else {}
 
+    entries = lock.get("package", [])
+    # uv.lock can list several versions of one package, one for each platform, and only one gets installed.
+    installed_names = {
+        _normal_name(entry["name"])
+        for entry in entries
+        if (_normal_name(entry["name"]), entry.get("version")) in installs
+    }
+
     found: list[Package] = []
     missing: list[tuple[str, bool]] = []
-    for entry in lock.get("package", []):
+    for entry in entries:
         name, version = entry["name"], entry.get("version")
         source = entry.get("source", {})
-        if version is None or "editable" in source or "virtual" in source:
-            # The project itself, which is not a dependency.
+        if version is None or {"editable", "virtual", "path", "directory"} & set(source):
+            # The project itself, or local code that can change under one version.
             continue
 
         is_direct = _normal_name(name) in direct
         record = installs.get((_normal_name(name), version))
         if site is None or record is None:
-            missing.append((name, is_direct))
+            if _normal_name(name) not in installed_names:
+                missing.append((name, is_direct))
             continue
-        found.append(Package("python", name, version, "site-packages", site, _record_files(record), is_direct))
+
+        # A package from git can change under one version, so its commit is part of the key.
+        pin = source.get("git", "")
+        found.append(Package("python", name, version, pin, "site-packages", site, _record_files(record), is_direct))
 
     return found, missing
 
