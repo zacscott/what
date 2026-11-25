@@ -7,6 +7,7 @@ import pytest
 from conftest import BENDER, SPLIT, git
 
 from what import search
+from what.git import UnknownRef
 from what.index import Index
 
 
@@ -334,3 +335,41 @@ def test_part_of_a_name_is_found_after_edits_and_the_name_index_stays_whole(inde
 
     with index.connect() as session:
         session.insert_symbol_name("integrity-check")
+
+
+def test_show_at_a_ref_prints_the_body_a_method_had_then(index: Index, repo: Path) -> None:
+    (repo / "src/BananaBender.php").write_text(BENDER.replace("'banana', $count", "'plantain', $count * 2"))
+    git(repo, "commit", "-q", "-am", "Bend plantains")
+
+    assert "plantain" in search.show(index, "BananaBender.bandana")
+    assert search.show(index, "BananaBender.bandana", ref="HEAD~1").splitlines() == [
+        "HEAD~1:src/BananaBender.php:3-5",
+        "    public function bandana(int $count): string {",
+        "        return str_repeat('banana', $count);",
+        "    }",
+    ]
+
+
+def test_find_at_a_ref_finds_a_definition_that_was_deleted_later(index: Index) -> None:
+    assert search.find(index, "banana_split", ref="HEAD~1").splitlines() == [
+        "HEAD~1:legacy/split.py:1:def banana_split(scoops: int) -> str:",
+    ]
+    assert search.find(index, "banana_split", ref="main").startswith(
+        "Nothing named or containing 'banana_split' at main"
+    )
+
+
+def test_outline_at_a_ref_reads_the_file_from_git(index: Index) -> None:
+    assert search.outline(index, "split.py", ref="HEAD~1").splitlines() == [
+        "HEAD~1:legacy/split.py",
+        "  1-3 def banana_split(scoops: int) -> str:",
+    ]
+
+
+def test_show_at_a_ref_says_when_the_symbol_is_not_there(index: Index) -> None:
+    assert search.show(index, "banana_split", ref="main") == "No symbol or file called 'banana_split' at main."
+
+
+def test_an_unknown_ref_raises_an_error_that_names_it(index: Index) -> None:
+    with pytest.raises(UnknownRef, match="'no-such-branch' is not a branch, tag or commit"):
+        search.find(index, "banana", ref="no-such-branch")

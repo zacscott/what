@@ -12,7 +12,7 @@ from what import git
 from what.config import settings
 from what.index import Index
 from what.models import IndexSession, Place, SymbolHit, path_matches
-from what.symbols import split_lines
+from what.symbols import Symbol, extract, split_lines
 
 TYPE_KINDS = {"class", "interface", "trait", "enum", "struct", "type", "module", "namespace", "impl"}
 CALLABLE_KINDS = {"function", "method"}
@@ -39,11 +39,15 @@ def lookup(
     kind: str | None = None,
     path: str | None = None,
     limit: int = 30,
+    ref: str | None = None,
 ) -> str:
     """
     Run the search that fits the query. A line range such as "src/a.py:45-80" is shown. A query that
     names one file gives the file's outline, or its text when it defines nothing. Anything else is a name for find.
     """
+    if ref is not None:
+        return _lookup_at_ref(index, query, kind, path, limit, ref)
+
     index.refresh()
 
     if LINE_RANGE.fullmatch(query):
@@ -61,14 +65,40 @@ def lookup(
     return _outline(index, query) if defines_something else _show(index, query, None)
 
 
+def _lookup_at_ref(
+    index: Index,
+    query: str,
+    kind: str | None,
+    path: str | None,
+    limit: int,
+    ref: str,
+) -> str:
+    if LINE_RANGE.fullmatch(query):
+        return _show_at_ref(index, query, path, ref)
+
+    names_a_file = not kind and ("/" in query or "." in query)
+    places = _resolve_tree_path(_tree_at(index, ref)[1], ref, query) if names_a_file else []
+
+    if len(places) != 1:
+        return _find_at_ref(index, query, kind, path, limit, ref)
+    return _outline_at_ref(index, query, ref)
+
+
 def find(
     index: Index,
     query: str,
     kind: str | None = None,
     path: str | None = None,
     limit: int = 30,
+    ref: str | None = None,
 ) -> str:
-    """Symbols and file paths whose name matches the query."""
+    """
+    Symbols and file paths whose name matches the query. With a ref, the search reads the files at that ref from git
+    in place of the working tree.
+    """
+    if ref is not None:
+        return _find_at_ref(index, query, kind, path, limit, ref)
+
     index.refresh()
     return _find(index, query, kind, path, limit)
 
@@ -95,6 +125,11 @@ def _find(index: Index, query: str, kind: str | None, path: str | None, limit: i
             return f"Nothing named or containing {query!r} in live or deleted files."
         return "\n".join([f"No symbol or path named {query!r}. Text matches:", *text_matches])
 
+    return "\n".join(_found_lines(hits, paths, limit))
+
+
+def _found_lines(hits: list[SymbolHit], paths: list[Place], limit: int) -> list[str]:
+    """The output of find: symbol hits grouped by file, then the files whose path matched."""
     output: list[str] = []
     shown = hits[:limit]
     by_place: dict[Place, list[SymbolHit]] = {}
@@ -110,7 +145,43 @@ def _find(index: Index, query: str, kind: str | None, path: str | None, limit: i
         more_files = len({hit.place for hit in hits[limit:]} - set(by_place))
         output.append(f"+{len(hits) - limit} more symbols in {more_files} other files. Add path or kind to narrow.")
 
-    return "\n".join(output)
+    return output
+
+
+def _find_at_ref(
+    index: Index,
+    query: str,
+    kind: str | None,
+    path: str | None,
+    limit: int,
+    ref: str,
+) -> str:
+    """find, on the files at a git ref. Only the files that contain the name are parsed."""
+    words = query.split()
+    if not words:
+        return "Give a symbol name or part of a file path."
+
+    parent, name = _split_qualified("".join(words))
+    words = words if len(words) > 1 else [name]
+    commit, tree = _tree_at(index, ref)
+
+    symbols = [
+        hit
+        for hit in _symbols_at(index, commit, tree, ref, max(words, key=len), path)
+        if _parent_and_kind_match(hit, parent, kind)
+    ]
+    hits = _ranked(
+        [
+            [hit for hit in symbols if hit.name.lower() == name.lower()],
+            [hit for hit in symbols if hit.name.lower().startswith(name.lower())],
+            [hit for hit in symbols if all(word.lower() in hit.name.lower() for word in words)],
+        ]
+    )
+    paths = [] if kind else _paths_at(tree, ref, words, path)
+
+    if not hits and not paths:
+        return f"Nothing named or containing {query!r} at {ref}."
+    return "\n".join(_found_lines(hits, paths, limit))
 
 
 def grep(
@@ -216,8 +287,11 @@ def _text_search(
     return found
 
 
-def outline(index: Index, path: str) -> str:
-    """Every symbol in one file with its line range, indented by nesting."""
+def outline(index: Index, path: str, ref: str | None = None) -> str:
+    """Every symbol in one file with its line range, indented by nesting. With a ref, the file is read at that ref."""
+    if ref is not None:
+        return _outline_at_ref(index, path, ref)
+
     index.refresh()
     return _outline(index, path)
 
@@ -229,10 +303,24 @@ def _outline(index: Index, path: str) -> str:
             return _path_choices(path, places)
         symbols = session.symbols_in_blob(places[0].blob_row)
 
-    if not symbols:
-        return f"{places[0].ref}\n  (no symbols found; use show to read it)"
+    return _outline_lines(places[0], symbols)
 
-    output = [places[0].ref]
+
+def _outline_at_ref(index: Index, path: str, ref: str) -> str:
+    places = _resolve_tree_path(_tree_at(index, ref)[1], ref, path)
+    if len(places) != 1:
+        return _path_choices(path, places)
+
+    text = _read(index, places[0])
+    symbols = extract(places[0].path, text) if text is not None else []
+    return _outline_lines(places[0], [_hit(places[0], symbol) for symbol in symbols])
+
+
+def _outline_lines(place: Place, symbols: list[SymbolHit]) -> str:
+    if not symbols:
+        return f"{place.ref}\n  (no symbols found; use show to read it)"
+
+    output = [place.ref]
     open_ends: list[int] = []
     for hit in symbols:
         while open_ends and hit.line > open_ends[-1]:
@@ -243,12 +331,20 @@ def _outline(index: Index, path: str) -> str:
     return "\n".join(output)
 
 
-def show(index: Index, target: str, path: str | None = None) -> str:
+def show(
+    index: Index,
+    target: str,
+    path: str | None = None,
+    ref: str | None = None,
+) -> str:
     """
     The source of one symbol, a line range or a whole file. target is a symbol
     name ("bandana", "BananaBender.bandana"), "path:45-80" or a path. Deleted
-    files are read from git.
+    files are read from git. With a ref, the source is read at that ref.
     """
+    if ref is not None:
+        return _show_at_ref(index, target, path, ref)
+
     index.refresh()
     return _show(index, target, path)
 
@@ -276,6 +372,42 @@ def _show(index: Index, target: str, path: str | None) -> str:
             return _path_choices(target, places)
         return f"No symbol or file called {target!r}. Use find to search by part of a name."
 
+    return _show_hits(index, hits)
+
+
+def _show_at_ref(
+    index: Index,
+    target: str,
+    path: str | None,
+    ref: str,
+) -> str:
+    commit, tree = _tree_at(index, ref)
+    line_range = LINE_RANGE.fullmatch(target)
+    places = _resolve_tree_path(tree, ref, line_range.group(1) if line_range else target)
+
+    if line_range and len(places) != 1:
+        return _path_choices(line_range.group(1), places)
+
+    if len(places) == 1:
+        first = int(line_range.group(2)) if line_range else 1
+        last = int(line_range.group(3) or first) if line_range else None
+        return _source(index, places[0], first, last)
+
+    parent, name = _split_qualified(target)
+    symbols = _symbols_at(index, commit, tree, ref, name, path)
+    hits = _ranked(
+        [[hit for hit in symbols if hit.name.lower() == name.lower() and _parent_and_kind_match(hit, parent, None)]]
+    )
+
+    if not hits:
+        if len(places) > 1:
+            return _path_choices(target, places)
+        return f"No symbol or file called {target!r} at {ref}."
+    return _show_hits(index, hits)
+
+
+def _show_hits(index: Index, hits: list[SymbolHit]) -> str:
+    """The source of the best hit, and where the others are."""
     best = hits[0]
     output = _source(index, best.place, best.line, best.end_line)
 
@@ -349,11 +481,14 @@ def _index_or_end(pattern: str, character: str, start: int) -> int:
 
 
 def _split_qualified(name: str) -> tuple[str | None, str]:
-    """Split "Parent::name", "Parent.name" or "Parent#name" into its two parts."""
+    """
+    Split "Parent::name", "Parent.name" or "Parent#name" into its two parts. The index keeps a class's name without
+    its namespace, so "Phinx\\Db\\Table.addIndex" gives "Table" and "addIndex".
+    """
     parts = re.split(r"::|[.#]", name)
     if len(parts) >= 2 and all(parts[-2:]):
-        return parts[-2], parts[-1]
-    return None, name
+        return parts[-2].rsplit("\\", 1)[-1], parts[-1]
+    return None, name.rsplit("\\", 1)[-1]
 
 
 def _find_symbols(
@@ -549,12 +684,7 @@ def _innermost(symbols: list[SymbolHit], line: int) -> SymbolHit | None:
 
 def _source(index: Index, place: Place, first: int, last: int | None) -> str:
     """Lines first to last of a file, under a "path:first-last" heading. last=None means to the end."""
-    if place.commit is None:
-        text = index.read_live(place.path)
-    else:
-        content = next(iter(git.read_blobs(index.root, [place.oid])))[1]
-        text = content.decode("utf-8", "replace") if content else None
-
+    text = _read(index, place)
     if text is None:
         return f"{place.ref} can't be shown: it is binary, larger than 1MB, or no longer in git."
 
@@ -567,6 +697,86 @@ def _source(index: Index, place: Place, first: int, last: int | None) -> str:
         output.append(f"({last - shown_last} more lines. Continue with show {place.ref}:{shown_last + 1}-{last})")
 
     return "\n".join(output)
+
+
+def _read(index: Index, place: Place) -> str | None:
+    """The text of a file, from disk or from git. None when it is binary, too big or gone."""
+    if place.in_working_tree:
+        return index.read_live(place.path)
+
+    content = next(iter(git.read_blobs(index.root, [place.oid])))[1]
+    return content.decode("utf-8", "replace") if content else None
+
+
+def _tree_at(index: Index, ref: str) -> tuple[str, dict[str, str]]:
+    """The commit a ref names, and every file at it with its blob id. Raises git.UnknownRef when there is no commit."""
+    if not index.in_git:
+        raise git.UnknownRef(f"--ref needs a git repository, and {index.root} is not one")
+
+    commit = git.commit_of(index.root, ref)
+    return commit, git.files_at(index.root, commit)
+
+
+def _resolve_tree_path(tree: dict[str, str], ref: str, path: str) -> list[Place]:
+    """The file a path names at a rf, the way _resolve_path finds it in the working tree."""
+    path = path.removeprefix(ref + ":").removeprefix("./")
+    if path in tree:
+        return [Place(path, tree[path], 0, tree=ref)]
+
+    return [Place(known, oid, 0, tree=ref) for known, oid in tree.items() if known.endswith("/" + path)]
+
+
+def _paths_at(
+    tree: dict[str, str],
+    ref: str,
+    words: list[str],
+    path_filter: str | None,
+) -> list[Place]:
+    """Files at a ref whose path contains every word, shortest path first."""
+    found = [
+        Place(path, oid, 0, tree=ref)
+        for path, oid in tree.items()
+        if all(word.lower() in path.lower() for word in words) and path_matches(path, path_filter)
+    ]
+    return sorted(found, key=lambda place: len(place.path))
+
+
+def _symbols_at(
+    index: Index,
+    commit: str,
+    tree: dict[str, str],
+    ref: str,
+    text: str,
+    path_filter: str | None,
+) -> list[SymbolHit]:
+    """
+    Every symbol in the files at a ref that contain text. git grep picks those files, so a search
+    parses only them and needs no index of the ref.
+    """
+    places = [
+        Place(path, tree[path], 0, tree=ref)
+        for path in git.paths_containing(index.root, commit, text)
+        if path in tree and path_matches(path, path_filter)
+    ]
+    hits: list[SymbolHit] = []
+
+    for place, (_, content) in zip(places, git.read_blobs(index.root, [place.oid for place in places])):
+        if content is not None and len(content) <= settings.MAX_BYTES:
+            symbols = extract(place.path, content.decode("utf-8", "replace"))
+            hits.extend(_hit(place, symbol) for symbol in symbols)
+
+    return hits
+
+
+def _hit(place: Place, symbol: Symbol) -> SymbolHit:
+    return SymbolHit(place, symbol.name, symbol.kind, symbol.parent, symbol.line, symbol.end_line, symbol.signature)
+
+
+def _parent_and_kind_match(hit: SymbolHit, parent: str | None, kind: str | None) -> bool:
+    """The filters the index applies in SQL, for symbols that were parsed without the index."""
+    if parent and (hit.parent or "").lower() != parent.lower():
+        return False
+    return not kind or hit.kind == kind.lower()
 
 
 def _commits_changing(index: Index, text: str) -> list[str]:

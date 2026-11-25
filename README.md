@@ -48,7 +48,10 @@ src/BananaBender.php:2:class BananaBender extends Lady
 what src/BananaBender.php:45-80  # those lines
 what show Banana.bend            # one method
 what grep "str_repeat("          # text, under the symbol it sits in
+what show Banana.bend --ref origin/dev  # the method as it is on another branch
 ```
+
+`--ref` takes anything git accepts: a branch, a tag, a commit, `origin/dev` or `HEAD~3`. It works on `find`, `show` and `outline`, and reads from git, so the ref needs no index of its own.
 
 The first search builds the index. `what --index` builds it up front.
 

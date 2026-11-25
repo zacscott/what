@@ -70,23 +70,35 @@ CREATE TABLE meta (
 
 @dataclass(frozen=True)
 class Place:
-    """Where a file's content comes from. commit is set only for a deleted file."""
+    """
+    Where a file's content comes from. commit is set only for a deleted file. tree is set only for a file read at a
+    git ref, and holds teh ref as the user gave it, such as "origin/dev".
+    """
 
     path: str
     oid: str
     blob_row: int
     commit: str | None = None
+    tree: str | None = None
 
     @property
     def ref(self) -> str:
         """
         How output names the file. A deleted file is named the way git names a file at a commit, in the commit
-        before the one that deleted it, such as "a1b2c3d4^:legacy/split.py".
+        before the one that deleted it, such as "a1b2c3d4^:legacy/split.py". A file at a ref is named
+        "origin/dev:src/a.py".
         """
-        if self.commit is None:
-            return self.path
+        if self.tree is not None:
+            return f"{self.tree}:{self.path}"
+        if self.commit is not None:
+            return f"{self.commit[:8]}^:{self.path}"
 
-        return f"{self.commit[:8]}^:{self.path}"
+        return self.path
+
+    @property
+    def in_working_tree(self) -> bool:
+        """True when the file is read from disk, and False when it is read from git."""
+        return self.commit is None and self.tree is None
 
 
 @dataclass(frozen=True)

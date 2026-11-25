@@ -5,6 +5,7 @@
 - `what <name>`: where a class, function, method or file is defined. `Banana.bend` picks a method of a class. Options: `--kind class`, `--path src/`.
 - `what <file>`: what a file defines, with line ranges. `what src/a.py:45-80` prints those lines.
 - `what show <symbol>`: the source of one symbol and not the whole file.
+- `--ref <branch, tag or commit>` on `what <name>`, `show`, `find` and `outline` answers at that ref, such as `what show Banana.bend --ref origin/dev`.
 - `what grep <text>`: text in file contents, each hit under the function or class it sits in. Options: `--regex`, `--path`, `--deleted`, `--commits`.
 
 Files that git history deleted are found too. They are named `COMMIT^:path`, git's name for the file in the commit before the one that deleted it.

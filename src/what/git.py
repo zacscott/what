@@ -13,6 +13,10 @@ class NotARepository(Exception):
     """The folder the command ran in is not inside a git repository."""
 
 
+class UnknownRef(Exception):
+    """A ref the user named is not a branch, tag or commit in the repository."""
+
+
 @dataclass(frozen=True)
 class Deletion:
     """A file that a commit deleted, and the blob that held its last content."""
@@ -80,6 +84,39 @@ def _tracked(output: bytes) -> dict[str, str]:
             files[path] = oid
 
     return files
+
+
+def commit_of(root: Path, ref: str) -> str:
+    """The commit a ref namse, such as a branch, tag, "origin/dev" or "HEAD~3". Raises UnknownRef when there is none."""
+    try:
+        return run(root, "rev-parse", "--verify", "--quiet", "--end-of-options", f"{ref}^{{commit}}").decode().strip()
+    except subprocess.CalledProcessError as error:
+        raise UnknownRef(f"{ref!r} is not a branch, tag or commit in this repository") from error
+
+
+def files_at(root: Path, commit: str) -> dict[str, str]:
+    """Every file at a commit and its blob id, from `git ls-tree`. Submodules and symlinks are left out."""
+    files: dict[str, str] = {}
+
+    for entry in _split(run(root, "ls-tree", "-r", "-z", "--full-tree", commit)):
+        details, path = entry.split("\t", 1)
+        mode, kind, oid = details.split(" ")
+        if kind == "blob" and mode.startswith("100"):
+            files[path] = oid
+
+    return files
+
+
+def paths_containing(root: Path, commit: str, text: str) -> list[str]:
+    """The text files at a commit tjat contain text, ignoring case."""
+    try:
+        output = run(root, "grep", "-l", "-z", "-I", "-i", "-F", "-e", text, commit)
+    except subprocess.CalledProcessError:
+        # git grep exits with 1 when nothing matches.
+        return []
+
+    # git grep names each file "<commit>:<path>".
+    return [entry.removeprefix(commit + ":") for entry in _split(output)]
 
 
 def is_ancestor(root: Path, older: str, newer: str) -> bool:

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import click
 
-from what import directory, search
+from what import directory, git, search
 from what.index import Index
 
 DESCRIPTION = """\
@@ -29,9 +29,11 @@ examples:
   what show Banana.bend            the source of one symbol
   what grep "str_repeat("          text, each hit under the function it sits in
   what grep "bend\\w+" --regex --deleted
+  what show Banana.bend --ref origin/dev   the method as it is on another branch
 """
 
 PATH_HELP = "only files whose path contains this, or matches this glob"
+REF_HELP = "search the files at this branch, tag or commit in place of the working tree"
 KIND_HELP = "only this kind: class, function, method, interface, enum..."
 
 
@@ -78,7 +80,7 @@ def main() -> None:
     """Run the command line. The installed `what` and `python -m what` both start here."""
     try:
         app(prog_name="what")
-    except directory.TooManyFiles as error:
+    except (directory.TooManyFiles, git.UnknownRef) as error:
         sys.exit(f"what: {error}")
 
 
@@ -87,9 +89,16 @@ def main() -> None:
 @click.option("--kind", help=KIND_HELP)
 @click.option("--path", help=PATH_HELP)
 @click.option("--limit", default=30, show_default=True)
-def lookup(query: tuple[str, ...], kind: str | None, path: str | None, limit: int) -> None:
+@click.option("--ref", help=REF_HELP)
+def lookup(
+    query: tuple[str, ...],
+    kind: str | None,
+    path: str | None,
+    limit: int,
+    ref: str | None,
+) -> None:
     """Find a name, list what a file defines or print a line range. what runs this when no command is given."""
-    print(search.lookup(_searchable_index(), " ".join(query), kind, path, limit))
+    print(search.lookup(_searchable_index(), " ".join(query), kind, path, limit, ref))
 
 
 @app.command()
@@ -97,9 +106,16 @@ def lookup(query: tuple[str, ...], kind: str | None, path: str | None, limit: in
 @click.option("--kind", help=KIND_HELP)
 @click.option("--path", help=PATH_HELP)
 @click.option("--limit", default=30, show_default=True)
-def find(query: tuple[str, ...], kind: str | None, path: str | None, limit: int) -> None:
+@click.option("--ref", help=REF_HELP)
+def find(
+    query: tuple[str, ...],
+    kind: str | None,
+    path: str | None,
+    limit: int,
+    ref: str | None,
+) -> None:
     """Find where a class, function, method, type or file is defined, by name or part of one."""
-    print(search.find(_searchable_index(), " ".join(query), kind, path, limit))
+    print(search.find(_searchable_index(), " ".join(query), kind, path, limit, ref))
 
 
 @app.command()
@@ -124,17 +140,19 @@ def grep(
 
 @app.command()
 @click.argument("path")
-def outline(path: str) -> None:
+@click.option("--ref", help=REF_HELP)
+def outline(path: str, ref: str | None) -> None:
     """List every symbol in one file with its line range. PATH can be the end of a path, and deleted files work too."""
-    print(search.outline(_searchable_index(), path))
+    print(search.outline(_searchable_index(), path, ref))
 
 
 @app.command()
 @click.argument("target")
 @click.option("--path", help="picks the file when several define the symbol")
-def show(target: str, path: str | None) -> None:
+@click.option("--ref", help=REF_HELP)
+def show(target: str, path: str | None, ref: str | None) -> None:
     """Print the source of one symbol ("Banana.bend"), a line range ("src/a.py:45-80") or a file."""
-    print(search.show(_searchable_index(), target, path))
+    print(search.show(_searchable_index(), target, path, ref))
 
 
 def _open_index() -> Index:

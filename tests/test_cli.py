@@ -111,3 +111,17 @@ def test_prompt_names_every_search() -> None:
     printed = run("--prompt")
     for usage in ["`what <name>`", "`what <file>`", "`what show ", "`what grep "]:
         assert usage in printed
+
+
+def test_a_ref_option_reads_the_files_at_that_ref(cache: Path) -> None:
+    assert run("show", "banana_split", "--ref", "HEAD~1").startswith("HEAD~1:legacy/split.py:1-3\ndef banana_split")
+    assert run("banana_split", "--ref", "HEAD~1").startswith("HEAD~1:legacy/split.py:1:def banana_split")
+
+
+def test_an_unknown_ref_exits_with_an_error(cache: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["what", "show", "banana", "--ref", "no-such-branch"])
+
+    with pytest.raises(SystemExit, match="what: 'no-such-branch' is not a branch, tag or commit") as exit:
+        cli.main()
+
+    assert exit.value.code != 0
