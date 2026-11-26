@@ -18,7 +18,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
-from what import models
+from what import database, models
 from what.config import settings
 from what.index import Index
 from what.models import InPackage, NameQuery, Place, SymbolHit
@@ -168,11 +168,9 @@ def project_folders(index: Index) -> list[str]:
     folders = {""}
 
     with index.connect() as session:
-        for lockfile in LOCKFILES:
-            for place in session.places_ending_with(lockfile):
-                is_dependency = "vendor/" in place.path or "node_modules/" in place.path
-                if place.is_live and not is_dependency:
-                    folders.add(place.path.removesuffix(lockfile))
+        for path in session.live_paths_named(LOCKFILES):
+            if "vendor/" not in path and "node_modules/" not in path:
+                folders.add(path[: path.rfind("/") + 1])
 
     return sorted(folders)
 
@@ -200,7 +198,7 @@ def package_rows(index: Index, packages: Iterable[Package]) -> dict[int, Package
     """
     rows: dict[int, Package] = {}
 
-    with models.connect_dependencies(_index_path(index)) as session:
+    with database.connect_dependencies(_index_path(index)) as session:
         for package in packages:
             row = session.package_row(package.ecosystem, package.name, version=package.cache_version)
             if row is None:
@@ -228,7 +226,7 @@ def find_symbols(
     rows = list(packages)
     parent, kind = query.parent, query.kind
 
-    with models.connect_dependencies(_index_path(index)) as session:
+    with database.connect_dependencies(_index_path(index)) as session:
         tiers = [
             session.symbols_named(query.name, parent=parent, kind=kind, packages=rows),
             session.symbols_starting_with(query.name, parent=parent, kind=kind, packages=rows),
@@ -240,7 +238,7 @@ def find_symbols(
 
 def source_places(index: Index, packages: dict[int, Package]) -> list[Place]:
     """Every source file of the packages, for a text search to read from disk."""
-    with models.connect_dependencies(_index_path(index)) as session:
+    with database.connect_dependencies(_index_path(index)) as session:
         files = session.package_files(list(packages))
 
     return [_place(packages[row], path) for row, path in files]
@@ -337,8 +335,7 @@ def _composer(root: Path, lockfile: str) -> LockfileRead:
 def _npm(root: Path, lockfile: str) -> LockfileRead:
     """
     The packages in package-lock.json that are installed in node_modules, and the (name, direct) of those that
-    aren't and of those installed at another version. Each key of "packages" is the folder the package is
-    installed in, so nested installs are found too.
+    aren't and of those installed at another version. Each key of "packages" is the folder the package is installed in, so nested installs are found too.
     """
     lock = _json(root / lockfile)
     packages: dict[str, Any] = lock.get("packages", {})
@@ -374,9 +371,8 @@ def _npm(root: Path, lockfile: str) -> LockfileRead:
 def _python(root: Path, lockfile: str) -> LockfileRead:
     """
     The packages in uv.lock or poetry.lock that are installed in the virtualenv, and the (name, direct) of those
-    that aren't and of those installed at another version. The direct dependencies are the ones pyproject.toml
-    names. The files of each package come froom the RECORD file pip and uv write, since a distribution's name is
-    often not the name of its folder.
+    that aren't and of those installed at another version. The direct dependencies are the ones pyproject.toml names. The files of each package come froom the
+    RECORD file pip and uv write, since a distribution's name is often not the name of its folder.
     """
     with open(root / lockfile, "rb") as file:
         lock = tomllib.load(file)

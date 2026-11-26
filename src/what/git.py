@@ -3,8 +3,7 @@
 import hashlib
 import os
 import subprocess
-from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -49,11 +48,23 @@ def run(root: Path, *args: str, stdin: bytes | None = None, timeout: float | Non
     return subprocess.run(_command(root, *args), input=stdin, capture_output=True, check=True, timeout=timeout).stdout
 
 
-def repo_root(start: Path) -> Path:
+class Repository(NamedTuple):
+    """Where a repository's working tree is, and the file git keeps its list of staged files in."""
+
+    root: Path
+    index_file: Path
+
+
+def repository(start: Path) -> Repository:
+    """The repository a folder is inside. Raises NotARepository when there is none."""
     try:
-        return Path(run(start, "rev-parse", "--show-toplevel").decode().strip())
+        output = run(start, "rev-parse", "--show-toplevel", "--git-path", "index").decode()
     except (subprocess.CalledProcessError, FileNotFoundError) as error:
         raise NotARepository(f"{start} is not inside a git repository") from error
+
+    # git prints the index file's path relative to the folder the command ran in.
+    root, index_file = output.splitlines()
+    return Repository(Path(root), start / index_file)
 
 
 def head(root: Path) -> str | None:
@@ -64,21 +75,13 @@ def head(root: Path) -> str | None:
         return None
 
 
-class WorkingTree(NamedTuple):
-    """The tracked files with their blob ids, the tracked files that changed, and the untracked files."""
-
-    tracked: dict[str, str]
-    changed: set[str]
-    untracked: list[str]
-
-
-def working_tree(root: Path) -> WorkingTree:
+def unstaged_files(root: Path) -> set[str]:
     """
-    The tracked files with their blob ids, the tracked files that changed, and the untracked files. The three git
-    commands run at the same time, because each one takes 10 to 30ms and none of them depends on another.
+    The files whose content git's index holds no blob id for: the tracked files that changed since they were staged,
+    and the untracked files. The two git commands run at the same time, because each one takes 10 to 40ms and
+    neither depends on the other.
     """
     commands = [
-        ["ls-files", "--stage", "-z"],
         ["diff-files", "--name-only", "-z"],
         ["ls-files", "--others", "--exclude-standard", "-z"],
     ]
@@ -86,22 +89,21 @@ def working_tree(root: Path) -> WorkingTree:
         subprocess.Popen(_command(root, *args), stdout=subprocess.PIPE, stderr=subprocess.PIPE) for args in commands
     ]
 
-    outputs: list[bytes] = []
+    found: set[str] = set()
     for process in running:
         stdout, stderr = process.communicate()
         if process.returncode != 0:
             raise subprocess.CalledProcessError(process.returncode, process.args, stdout, stderr)
-        outputs.append(stdout)
+        found.update(_split(stdout))
 
-    staged, changed, untracked = outputs
-    return WorkingTree(_tracked(staged), set(_split(changed)), _split(untracked))
+    return found
 
 
-def _tracked(output: bytes) -> dict[str, str]:
+def tracked_files(root: Path) -> dict[str, str]:
     """Each tracked file's path and the blob id git's index holds for it, from `git ls-files --stage -z`."""
     files: dict[str, str] = {}
 
-    for entry in _split(output):
+    for entry in _split(run(root, "ls-files", "--stage", "-z")):
         details, path = entry.split("\t", 1)
         mode, oid, _stage = details.split(" ")
         # Submodules and symlinks have no file content of their own to index.
@@ -137,16 +139,23 @@ def paths_containing(
     commit: str,
     *,
     text: str,
+    among: Collection[str],
 ) -> list[str]:
-    """The text files at a commit tjat contain text, ignoring case."""
+    """The text files among these paths that contain text at a commit, ignoring case."""
+    if not among:
+        return []
+
+    # A path is given as ":(literal)path", so git doesn't read a "*" or "[" in it as a pattern.
+    named = ["--", *(f":(literal){path}" for path in among)] if len(among) <= settings.GREP_PATHS else []
     try:
-        output = run(root, "grep", "-l", "-z", "-I", "-i", "-F", "-e", text, commit)
+        output = run(root, "grep", "-l", "-z", "-I", "-i", "-F", "-e", text, commit, *named)
     except subprocess.CalledProcessError:
         # git grep exits with 1 when nothing matches.
         return []
 
     # git grep names each file "<commit>:<path>".
-    return [entry.removeprefix(commit + ":") for entry in _split(output)]
+    found = (entry.removeprefix(commit + ":") for entry in _split(output))
+    return [path for path in found if path in among]
 
 
 def other_branches(root: Path) -> list[Branch]:
@@ -292,6 +301,9 @@ def read_blobs(root: Path, oids: list[str]) -> Iterator[tuple[str, bytes | None]
 
     def read(chunk: list[str]) -> bytes:
         return _cat_file(root, chunk)
+
+    # Only a read of many blobs needs threads, so they are imported here, and a search doesn't pay for the import.
+    from concurrent.futures import ThreadPoolExecutor
 
     with ThreadPoolExecutor(settings.GIT_THREADS) as threads:
         for start in range(0, len(chunks), settings.GIT_THREADS):

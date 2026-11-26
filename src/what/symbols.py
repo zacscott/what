@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import json
-import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
+import logging
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import cache
 from typing import TYPE_CHECKING
 
+from what import log
 from what.config import settings
 
 if TYPE_CHECKING:
+    from concurrent.futures import ProcessPoolExecutor
+
     import tree_sitter_language_pack as grammars
     from tree_sitter import Node
+
+logger = logging.getLogger(__name__)
 
 # Languages whose grammar could not be downloaded. We don't retry them for every file.
 _unavailable: set[str] = set()
@@ -96,8 +100,8 @@ def extract(path: str, text: str) -> list[Symbol]:
 
     try:
         parsed = grammars.process(text, config)
-    except grammars.DownloadError:
-        _unavailable.add(language)
+    except grammars.DownloadError as error:
+        _mark_unavailable(language, error)
         return []
     except grammars.Error:
         return []
@@ -148,8 +152,8 @@ def text_roles(
 
     try:
         tree = grammars.get_parser(language).parse(text.encode())
-    except grammars.DownloadError:
-        _unavailable.add(language)
+    except grammars.DownloadError as error:
+        _mark_unavailable(language, error)
         return [Role.CODE] * len(positions)
     except grammars.Error:
         return [Role.CODE] * len(positions)
@@ -187,6 +191,12 @@ def _is_lone_string(node: Node) -> bool:
     return outer.parent is not None and outer.parent.type in {"expression_statement", "block", "module"}
 
 
+def _mark_unavailable(language: str, error: Exception) -> None:
+    """Stop trying a language whose grammar could not be downloaded, and log it, since its files get no symbols."""
+    _unavailable.add(language)
+    logger.warning("no grammar for %s, so its files have no symbols: %s", language, error)
+
+
 def extract_many(files: list[tuple[str, str]]) -> list[list[Symbol]]:
     """
     The definitions in each file, given as (path, text), in the same order. A batch of settings.PARALLEL_FILES or
@@ -208,7 +218,24 @@ def _workers() -> ProcessPoolExecutor:
     The processes that parse files, started once and kept for the rest of the run. They are started fresh, not
     forked, because forking a process that has open database connections and threads isn't safe.
     """
-    return ProcessPoolExecutor(mp_context=multiprocessing.get_context("spawn"))
+    # Only a big batch needs other processes, so these are imported here. Importing them costs about 6ms, which
+    # every search would pay.
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    return ProcessPoolExecutor(mp_context=multiprocessing.get_context("spawn"), initializer=start_worker)
+
+
+def start_worker() -> None:
+    """
+    Set up a process that parses files. It logs to the same file as the command. It leaves Ctrl-C to the command,
+    which a terminal sends it to as well, or each worker would print a traceback of its own.
+    """
+    # Only a worker needs this module, so a search doesn't pay for the import.
+    import signal
+
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    log.start()
 
 
 def _kind(value: object) -> Kind:
@@ -238,7 +265,7 @@ def _add_structure(
             code_lines = [
                 line for line in (item.signature or item.name).splitlines() if not line.lstrip().startswith(("#", "//"))
             ]
-            signature = " ".join(" ".join(code_lines).split())
+            signature = _on_one_line(code_lines)
 
             found[(item.name, line)] = Symbol(
                 item.name,
@@ -250,6 +277,27 @@ def _add_structure(
             )
 
         _add_structure(item.children, parent=item.name or parent, found=found)
+
+
+def _on_one_line(lines: list[str]) -> str:
+    """
+    A signature written over several lines, joined the way it would be written on one. For example
+    "def bend(", "    count: int,", ") -> str:" gives "def bend(count: int) -> str:".
+    """
+    signature = ""
+    for line in (" ".join(line.split()) for line in lines):
+        if not line:
+            continue
+
+        if not signature or signature.endswith(("(", "[")):
+            signature += line
+        elif line.startswith((")", "]")):
+            # The comma after the last parameter is only there because the parameters are on lines of their own.
+            signature = signature.removesuffix(",") + line
+        else:
+            signature += " " + line
+
+    return signature
 
 
 def _enclosing(found: dict[tuple[str, int], Symbol], line: int) -> str | None:

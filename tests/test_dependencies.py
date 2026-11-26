@@ -25,6 +25,7 @@ class Table {
 def install_composer(
     root: Path,
     packages: dict[str, str],
+    *,
     direct: list[str],
     installed: dict[str, str] | None = None,
 ) -> None:
@@ -56,23 +57,23 @@ def _class(package: str) -> str:
 
 
 def test_find_returns_a_class_that_is_only_in_vendor_with_its_package(index: Index, repo: Path) -> None:
-    install_composer(repo, {"robmorgan/phinx": "0.16.1"}, ["robmorgan/phinx"])
+    install_composer(repo, {"robmorgan/phinx": "0.16.1"}, direct=["robmorgan/phinx"])
 
-    assert search.find(index, "Phinx\\Db\\Table.addIndex").splitlines() == [
+    assert search.find(index, "Phinx\\Db\\Table.addIndex").text.splitlines() == [
         "vendor: robmorgan/phinx@0.16.1 src/Phinx/Db/Table.php:5:public function addIndex($columns, array $options = [])",
     ]
 
 
 def test_find_for_a_class_in_the_repository_does_not_search_dependencies(index: Index, repo: Path) -> None:
-    install_composer(repo, {"acme/bender": "1.0.0"}, ["acme/bender"])
+    install_composer(repo, {"acme/bender": "1.0.0"}, direct=["acme/bender"])
     (repo / "vendor/acme/bender/src/Phinx/Db/Helper.php").write_text("<?php\nclass BananaBender {}\n")
 
-    assert "vendor:" not in search.find(index, "BananaBender")
-    assert "vendor: acme/bender@1.0.0" in search.find(index, "BananaBender", deps=DependencyReach.DIRECT)
+    assert "vendor:" not in search.find(index, "BananaBender").text
+    assert "vendor: acme/bender@1.0.0" in search.find(index, "BananaBender", deps=DependencyReach.DIRECT).text
 
 
 def test_grep_leaves_out_dependencies_unless_asked(index: Index, repo: Path) -> None:
-    install_composer(repo, {"robmorgan/phinx": "0.16.1"}, ["robmorgan/phinx"])
+    install_composer(repo, {"robmorgan/phinx": "0.16.1"}, direct=["robmorgan/phinx"])
     (repo / "node_modules/left-pad").mkdir(parents=True)
     (repo / "node_modules/left-pad/index.js").write_text("// version 0.16.1\n")
     (repo / ".venv/lib/python3.12/site-packages").mkdir(parents=True)
@@ -81,18 +82,19 @@ def test_grep_leaves_out_dependencies_unless_asked(index: Index, repo: Path) -> 
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "Commit the installed dependencies")
 
-    assert search.grep(index, "version 0.16.1").startswith("No text matches")
-    assert "vendor: robmorgan/phinx@0.16.1 src/Phinx/Db/Table.php:6:return 'version 0.16.1';" in search.grep(
-        index, "version 0.16.1", deps=DependencyReach.DIRECT
+    assert search.grep(index, "version 0.16.1").text.startswith("No text matches")
+    assert (
+        "vendor: robmorgan/phinx@0.16.1 src/Phinx/Db/Table.php:6:        return 'version 0.16.1';"
+        in search.grep(index, "version 0.16.1", deps=DependencyReach.DIRECT).text
     )
 
 
 def test_show_reads_the_version_a_changed_lockfile_installs(index: Index, repo: Path) -> None:
-    install_composer(repo, {"robmorgan/phinx": "0.16.1"}, ["robmorgan/phinx"])
-    assert "return 'version 0.16.1';" in search.show(index, "Table.addIndex")
+    install_composer(repo, {"robmorgan/phinx": "0.16.1"}, direct=["robmorgan/phinx"])
+    assert "return 'version 0.16.1';" in search.show(index, "Table.addIndex").text
 
-    install_composer(repo, {"robmorgan/phinx": "0.17.0"}, ["robmorgan/phinx"])
-    output = search.show(index, "Table.addIndex")
+    install_composer(repo, {"robmorgan/phinx": "0.17.0"}, direct=["robmorgan/phinx"])
+    output = search.show(index, "Table.addIndex").text
 
     assert output.startswith("vendor: robmorgan/phinx@0.17.0 src/Phinx/Db/Table.php:5-7")
     assert "return 'version 0.17.0';" in output
@@ -106,8 +108,8 @@ def test_two_repositories_with_the_same_version_share_one_index_entry(
     other = tmp_path / "other"
     other.mkdir()
     git(other, "init", "-q", "-b", "main")
-    install_composer(repo, {"robmorgan/phinx": "0.16.1"}, ["robmorgan/phinx"])
-    install_composer(other, {"robmorgan/phinx": "0.16.1"}, ["robmorgan/phinx"])
+    install_composer(repo, {"robmorgan/phinx": "0.16.1"}, direct=["robmorgan/phinx"])
+    install_composer(other, {"robmorgan/phinx": "0.16.1"}, direct=["robmorgan/phinx"])
 
     search.find(index, "addIndex")
     search.find(Index(other, cache_dir=index.cache_dir), "addIndex")
@@ -117,10 +119,10 @@ def test_two_repositories_with_the_same_version_share_one_index_entry(
 
 
 def test_a_transitive_dependency_is_found_only_with_all_deps(index: Index, repo: Path) -> None:
-    install_composer(repo, {"robmorgan/phinx": "0.16.1", "symfony/helper": "6.0.0"}, ["robmorgan/phinx"])
+    install_composer(repo, {"robmorgan/phinx": "0.16.1", "symfony/helper": "6.0.0"}, direct=["robmorgan/phinx"])
 
-    assert search.find(index, "Helper", kind=Kind.CLASS).startswith("No class named 'Helper'")
-    assert search.find(index, "Helper", kind=Kind.CLASS, deps=DependencyReach.ALL).splitlines() == [
+    assert search.find(index, "Helper", kind=Kind.CLASS).text.startswith("No class named 'Helper'")
+    assert search.find(index, "Helper", kind=Kind.CLASS, deps=DependencyReach.ALL).text.splitlines() == [
         "vendor: symfony/helper@6.0.0 src/Phinx/Db/Table.php:4:class Helper",
     ]
 
@@ -129,11 +131,11 @@ def test_a_package_that_is_not_installed_is_skipped_with_a_note(index: Index, re
     install_composer(
         repo,
         {"robmorgan/phinx": "0.16.1", "acme/peel": "2.0.0"},
-        ["robmorgan/phinx", "acme/peel"],
+        direct=["robmorgan/phinx", "acme/peel"],
         installed={"robmorgan/phinx": "0.16.1"},
     )
 
-    assert search.find(index, "addIndex").splitlines() == [
+    assert search.find(index, "addIndex").text.splitlines() == [
         "vendor: robmorgan/phinx@0.16.1 src/Phinx/Db/Table.php:5:public function addIndex($columns, array $options = [])",
         "1 package in composer.lock isn't installed; run composer install",
     ]
@@ -168,10 +170,10 @@ def test_npm_and_python_packages_are_read_from_their_lockfiles(index: Index, rep
     )
     (repo / ".gitignore").write_text("node_modules/\n.venv/\n")
 
-    assert search.find(index, "leftPad").splitlines() == [
+    assert search.find(index, "leftPad").text.splitlines() == [
         "node_modules: left-pad@1.3.0 index.js:1:function leftPad(text, length)",
     ]
-    assert search.find(index, "peel_carefully").splitlines() == [
+    assert search.find(index, "peel_carefully").text.splitlines() == [
         "site-packages: peeler@2.0 peeler/__init__.py:1:def peel_carefully():",
     ]
 
@@ -180,20 +182,20 @@ def test_a_composer_package_installed_outside_vendor_is_found_where_installed_js
     index: Index,
     repo: Path,
 ) -> None:
-    install_composer(repo, {"robmorgan/phinx": "0.16.1"}, ["robmorgan/phinx"])
+    install_composer(repo, {"robmorgan/phinx": "0.16.1"}, direct=["robmorgan/phinx"])
     (repo / "vendor/robmorgan/phinx").rename(repo / "phinx")
     record = json.loads((repo / "vendor/composer/installed.json").read_text())
     record["packages"][0]["install-path"] = "../../phinx"
     (repo / "vendor/composer/installed.json").write_text(json.dumps(record))
     (repo / ".gitignore").write_text("vendor/\nphinx/\n")
 
-    assert search.find(index, "addIndex").splitlines() == [
+    assert search.find(index, "addIndex").text.splitlines() == [
         "vendor: robmorgan/phinx@0.16.1 src/Phinx/Db/Table.php:5:public function addIndex($columns, array $options = [])",
     ]
 
 
 def test_a_dev_branch_package_is_indexed_again_when_its_commit_changes(index: Index, repo: Path) -> None:
-    install_composer(repo, {"robmorgan/phinx": "dev-main"}, ["robmorgan/phinx"])
+    install_composer(repo, {"robmorgan/phinx": "dev-main"}, direct=["robmorgan/phinx"])
     installed = repo / "vendor/composer/installed.json"
     record = json.loads(installed.read_text())
     record["packages"][0]["source"] = {"reference": "aaa111"}
@@ -205,15 +207,15 @@ def test_a_dev_branch_package_is_indexed_again_when_its_commit_changes(index: In
     table = repo / "vendor/robmorgan/phinx/src/Phinx/Db/Table.php"
     table.write_text(table.read_text().replace("addIndex", "addKey"))
 
-    assert search.find(index, "addKey").startswith("vendor: robmorgan/phinx@dev-main src/Phinx/Db/Table.php:5:")
+    assert search.find(index, "addKey").text.startswith("vendor: robmorgan/phinx@dev-main src/Phinx/Db/Table.php:5:")
 
 
 def test_a_package_installed_at_another_version_is_searched_with_a_note(index: Index, repo: Path) -> None:
     install_composer(
-        repo, {"robmorgan/phinx": "0.16.12"}, ["robmorgan/phinx"], installed={"robmorgan/phinx": "0.16.11"}
+        repo, {"robmorgan/phinx": "0.16.12"}, direct=["robmorgan/phinx"], installed={"robmorgan/phinx": "0.16.11"}
     )
 
-    assert search.find(index, "addIndex").splitlines() == [
+    assert search.find(index, "addIndex").text.splitlines() == [
         "vendor: robmorgan/phinx@0.16.11 src/Phinx/Db/Table.php:5:public function addIndex($columns, array $options = [])",
         "1 package in composer.lock is installed at another version, which is what's searched; run composer install",
     ]
@@ -232,17 +234,17 @@ def test_an_optional_npm_package_that_is_not_installed_gets_no_note(index: Index
         )
     )
 
-    assert "package-lock.json" not in search.find(index, "nothing_is_called_this")
+    assert "package-lock.json" not in search.find(index, "nothing_is_called_this").text
 
 
 def test_a_lockfile_in_a_subfolder_is_read_and_its_vendor_left_out_of_grep(index: Index, repo: Path) -> None:
     (repo / "include").mkdir()
-    install_composer(repo / "include", {"robmorgan/phinx": "0.16.1"}, ["robmorgan/phinx"])
+    install_composer(repo / "include", {"robmorgan/phinx": "0.16.1"}, direct=["robmorgan/phinx"])
     (repo / "include/.gitignore").unlink()
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "Commit a PHP project in a subfolder, vendor included")
 
-    assert search.find(index, "addIndex").splitlines() == [
+    assert search.find(index, "addIndex").text.splitlines() == [
         "vendor: robmorgan/phinx@0.16.1 src/Phinx/Db/Table.php:5:public function addIndex($columns, array $options = [])",
     ]
-    assert search.grep(index, "version 0.16.1").startswith("No text matches")
+    assert search.grep(index, "version 0.16.1").text.startswith("No text matches")
