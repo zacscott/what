@@ -6,23 +6,27 @@ The tables, and the SQL for them, are in models.
 import fcntl
 import fnmatch
 import hashlib
+import logging
 import os
 import stat as stat_modes
 import subprocess
 import sys
 import time
 from collections.abc import Generator
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
+from enum import Enum
 from pathlib import Path
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, Protocol
 
-from what import directory, git, models
+from what import database, directory, git, models
 from what.config import settings
-from what.models import BranchListing, IndexSession
+from what.database import IndexSession
+from what.models import BranchListing
 from what.symbols import Symbol, extract_many
 
-# The lonng builds each take a lock, so only one process runs them at a time.
+logger = logging.getLogger(__name__)
+
+# The lonng builds that take a lock, so only one process runs each at a time.
 type LockName = Literal["history", "branches"]
 
 
@@ -44,15 +48,60 @@ class BranchState(NamedTuple):
     pending: int
 
 
+# What the index reads a lot of at once.
+type Reading = Literal["files", "deleted files", "branches"]
+
+
+class Report(Protocol):
+    """Called while the index reads a lot at once, with how far it is. The command line shows it as progress."""
+
+    def __call__(self, reading: Reading, *, done: int, total: int) -> None: ...
+
+
+def _report_nothing(reading: Reading, *, done: int, total: int) -> None:
+    """The report of an index that nobody watches."""
+
+
+class History(Enum):
+    """Whether the index holds the files that HEAD's history deleted."""
+
+    CURRENT = "up to date"
+    BUILDING = "being read now"
+    STALE = "not up to date"
+    NO_GIT = "not a git repository"
+
+
+class Status(NamedTuple):
+    """
+    What the index holds and how far its builds are. size is the bytes the index takes on disk. building is True
+    while a process reads deleted files or branches. build_wait is how many seconds a search waits before it starts
+    the background build again, or 0 when it would start one at once.
+    """
+
+    counts: models.Counts
+    size: int
+    history: History
+    building: bool
+    build_wait: float
+
+
 class Index:
     """The index of one repository. Each call opens its own connection, so any thread can use it."""
 
-    def __init__(self, root: Path, cache_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        cache_dir: Path | None = None,
+        *,
+        report: Report = _report_nothing,
+    ) -> None:
         # Whether the index was built from git. In directory mode there is no history, so there are no deleted files
         # or commits.
         self.in_git = True
+        # The file git keeps its list of staged files in, which changes whenever that list does.
+        self._git_index_file: Path | None = None
         try:
-            self.root = git.repo_root(root)
+            self.root, self._git_index_file = git.repository(root)
         except git.NotARepository:
             self.in_git = False
             self.root = root.resolve()
@@ -65,25 +114,33 @@ class Index:
         # Two checkouts can share a folder name, so the file name also carries a hash of the full path.
         digest = hashlib.sha1(str(self.root).encode()).hexdigest()[:10]
         self.path = cache_dir / f"{self.root.name}-{digest}.db"
+        self._report = report
 
     def connect(self) -> AbstractContextManager[IndexSession]:
         """Open the index. When the file is new or has an old schema version, this creates the tables first."""
-        return models.connect(self.path)
+        return database.connect(self.path)
 
     def refresh(self) -> None:
         """
         Make the index match the working tree, uncommitted edits included. Every
         search calls this first, so it only reads the files that changed.
         """
-        if self.in_git:
-            tracked, changed, untracked = git.working_tree(self.root)
-            # A file git reports as changed is hashed here, because its blob id in git's index is out of date.
-            unhashed = changed | set(untracked)
-        else:
-            tracked = {}
-            unhashed = set(directory.files(self.root))
+        staged = self._git_index_stat()
+        # A file git reports as changed is hashed here, because its blob id in git's index is out of date.
+        unhashed = git.unstaged_files(self.root) if self.in_git else set(directory.files(self.root))
 
         with self.connect() as session:
+            # When git's list of staged files is the one the last full refresh read, the tracked files that haven't
+            # changed are already indexed. Reading that list takes most of the time of a search that changes nothing.
+            if (
+                staged is not None
+                and staged == session.meta("git_index")
+                and staged == self._git_index_stat()
+                and self._refresh_unstaged(session, unhashed)
+            ):
+                return
+
+            tracked = git.tracked_files(self.root) if self.in_git else {}
             known = session.known_files()
             # Each entry is (path, blob id, stat). The blob id is None until the file is read.
             stale: list[StaleFile] = []
@@ -101,11 +158,12 @@ class Index:
                 if path in unhashed:
                     continue
                 present.add(path)
-                if path not in known or known[path].oid != oid:
+                # A file that was read from disk and is staged now keeps its content but must lose its stat. With
+                # the stat, every later search would take it for an unstaged file that went missing.
+                if path not in known or known[path].oid != oid or known[path].stat is not None:
                     stale.append(StaleFile(path, oid, None))
 
-            for start in range(0, len(stale), settings.BATCH_SIZE):
-                self._index_files(session, stale[start : start + settings.BATCH_SIZE])
+            self._index_stale(session, stale)
 
             removed = [path for path in known if path not in present]
             if removed:
@@ -113,6 +171,56 @@ class Index:
 
             if stale or removed:
                 session.delete_unused_blobs()
+                logger.info("%s: read %d files again and forgot %d", self.root, len(stale), len(removed))
+            if staged is not None:
+                session.set_meta("git_index", staged)
+
+    def _refresh_unstaged(self, session: IndexSession, unhashed: set[str]) -> bool:
+        """
+        Index again the unstaged files that changed, without reading git's list of tracked files. Returns False,
+        and changes nothing, when only that list can say what a file holds now.
+        """
+        known = session.files_read_from_disk()
+        stats = {path: self._stat(path) for path in unhashed}
+
+        # A file the index read from disk that git no longer lists as unstaged was deleted, staged or changed back.
+        if any(stats.get(path) is None for path in known):
+            return False
+
+        # An unstaged file that is gone from disk must leave the index, when the index still holds it.
+        if any(stat is None and session.has_file(path) for path, stat in stats.items()):
+            return False
+
+        stale = [
+            StaleFile(path, None, stat) for path, stat in stats.items() if stat is not None and known.get(path) != stat
+        ]
+        self._index_stale(session, stale)
+        if stale:
+            session.delete_unused_blobs()
+            logger.info("%s: read %d unstaged files again", self.root, len(stale))
+
+        return True
+
+    def _index_stale(self, session: IndexSession, stale: list[StaleFile]) -> None:
+        """Read the stale files again, one batch to a transaction, so a search in another process waits for one batch."""
+        for start in range(0, len(stale), settings.BATCH_SIZE):
+            self._report("files", done=start, total=len(stale))
+            self._index_files(session, stale[start : start + settings.BATCH_SIZE])
+
+    def _git_index_stat(self) -> str | None:
+        """
+        A value that changes whenever git writes its list of staged files. None outside git, and when the file is
+        missing, as in a repository with nothing staged yet.
+        """
+        if self._git_index_file is None:
+            return None
+
+        try:
+            stat = os.stat(self._git_index_file)
+        except OSError:
+            return None
+
+        return f"{stat.st_mtime_ns}:{stat.st_size}:{stat.st_ino}"
 
     def refresh_history(self) -> None:
         """
@@ -130,9 +238,6 @@ class Index:
                 return
 
             since = done if done and git.is_ancestor(self.root, older=done, newer=current) else None
-            if done and since is None:
-                # HEAD moved to another line of history, so the old list of deletions no longer applies.
-                session.delete_all_deleted_files()
 
             latest: dict[str, git.Deletion] = {}
             for deletion in git.deletions(self.root, since):
@@ -141,10 +246,19 @@ class Index:
             pending = list(latest.values())
 
             for start in range(0, len(pending), settings.BATCH_SIZE):
+                self._report("deleted files", done=start, total=len(pending))
                 self._index_deletions(session, pending[start : start + settings.BATCH_SIZE])
+
+            if since is None:
+                # HEAD moved to another line of history, so the paths its history never deleted are forgotten here,
+                # after the new ones are saved. Forgetting every path first leaves their blobs unused, so a search in
+                # between deletes them and the build reads them all from git again.
+                with session.write_transaction():
+                    session.delete_deleted_files(session.deleted_paths() - latest.keys())
 
             session.delete_unused_blobs()
             session.set_meta("history_head", current)
+            logger.info("%s: read %d deleted files up to commit %s", self.root, len(pending), current[:8])
 
     def refresh_branches(self, most: int | None = None) -> BranchState:
         """
@@ -182,9 +296,13 @@ class Index:
                 )
                 return git.changed_files(self.root, base=base, tip=branch.tip) if base else {}
 
-            # Each branch needs two git commands, and they spend most of their time waiting on the disk.
+            # Only a branch that moved needs threads, so they are imported here, and a search doesn't pay for the
+            # import. Each branch needs two git commands, and they spend most of their time waiting on the disk.
+            from concurrent.futures import ThreadPoolExecutor
+
             with ThreadPoolExecutor(settings.GIT_THREADS) as threads:
-                for branch, changed in zip(stale, threads.map(changed_files, stale)):
+                for done, (branch, changed) in enumerate(zip(stale, threads.map(changed_files, stale))):
+                    self._report("branches", done=done, total=len(stale))
                     self._index_branch(session, branch, head=_base_key(branch, current), files=sorted(changed.items()))
 
             gone = [name for name in known if name not in {branch.name for branch in branches}]
@@ -193,6 +311,7 @@ class Index:
                     session.delete_branches(gone)
             if stale or gone:
                 session.delete_unused_blobs()
+                logger.info("%s: read %d branches again and forgot %d", self.root, len(stale), len(gone))
 
         return BranchState(branches, 0)
 
@@ -205,8 +324,18 @@ class Index:
         if self.history_is_building() or self._is_locked("branches"):
             return
 
+        with self.connect() as session:
+            # A build sets this time when it starts and again when it fails, and removes it when it finishes. So
+            # a time still to come means a build has just started, or one failed or was killed not long ago.
+            if time.time() < float(session.meta("build_wait_until") or 0):
+                logger.info("%s: a background build started or failed not long ago, so none is started", self.root)
+                return
+            session.set_meta("build_wait_until", str(time.time() + settings.BUILD_RETRY_SECONDS))
+
+        logger.info("%s: starting the background build", self.root)
         subprocess.Popen(
-            [sys.executable, "-m", "what", "--index"],
+            # The folder is named, because a WHAT_ROOT the build inherits could name another one.
+            [sys.executable, "-m", "what", "-C", str(self.root), "index"],
             cwd=self.root,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -214,6 +343,18 @@ class Index:
             # A new session keeps the build alive when the harness kills the shell that ran the search.
             start_new_session=True,
         )
+
+    def build_finished(self) -> None:
+        """Record that the whole index was built, so the next search may start another build at once."""
+        with self.connect() as session:
+            session.delete_meta("build_wait_until")
+
+        logger.info("%s: the whole index is built", self.root)
+
+    def build_failed(self) -> None:
+        """Record that a build of the whole index failed, so no search starts another one for a while."""
+        with self.connect() as session:
+            session.set_meta("build_wait_until", str(time.time() + settings.BUILD_RETRY_SECONDS))
 
     def history_is_current(self) -> bool:
         if not self.in_git:
@@ -226,6 +367,26 @@ class Index:
         """True when another process holds the lock that refresh_history takes."""
         return self._is_locked("history")
 
+    def status(self) -> Status:
+        """What the index holds and how far its builds are. Nothing is read again to answer this."""
+        with self.connect() as session:
+            counts = session.counts()
+            build_wait = max(0.0, float(session.meta("build_wait_until") or 0) - time.time())
+
+        if not self.in_git:
+            history = History.NO_GIT
+        elif self.history_is_building():
+            history = History.BUILDING
+        else:
+            history = History.CURRENT if self.history_is_current() else History.STALE
+
+        # SQLite keeps the newest writes in a second file next to the index until it copies them in.
+        files = [self.path, self.path.with_name(self.path.name + "-wal")]
+        size = sum(file.stat().st_size for file in files if file.exists())
+
+        building = history == History.BUILDING or self._is_locked("branches")
+        return Status(counts=counts, size=size, history=history, building=building, build_wait=build_wait)
+
     def read_live(self, path: str) -> str | None:
         """The text of a file in the working tree, or None when it is binary, too big or gone."""
         return self.read_text(self.root / path)
@@ -237,7 +398,7 @@ class Index:
         except OSError:
             return None
 
-        return _as_text(content)
+        return as_text(content)
 
     def _stat(self, path: str) -> str | None:
         """
@@ -266,7 +427,7 @@ class Index:
                 content = (self.root / path).read_bytes()
             except OSError:
                 continue
-            text = _as_text(content) if _has_indexed_text(path) else None
+            text = as_text(content) if _has_indexed_text(path) else None
             read.append((path, oid or git.blob_id(content), stat, text))
 
         with session.write_transaction():
@@ -299,45 +460,29 @@ class Index:
         for start in range(0, len(files), settings.BATCH_SIZE):
             batch = files[start : start + settings.BATCH_SIZE]
             with session.write_transaction():
-                # A branch's text isn't indexed. It would make the index several times bigger, and a text search on
-                # branches reads the few files it needs from git.
-                blobs = self._add_git_blobs(session, batch, index_text=False)
+                blobs = self._add_git_blobs(session, batch)
                 session.save_branch_files(branch.name, [(path, blob) for (path, _), blob in zip(batch, blobs)])
 
         with session.write_transaction():
             session.save_branch(branch.name, tip=branch.tip, head=head, date=branch.date)
 
-    def _add_git_blobs(
-        self,
-        session: IndexSession,
-        files: list[tuple[str, str]],
-        *,
-        index_text: bool = True,
-    ) -> list[int]:
+    def _add_git_blobs(self, session: IndexSession, files: list[tuple[str, str]]) -> list[int]:
         """
         Index file contents that git holds, given as (path, blob id), and return their blob rows in the same order.
-        Only the contents the index hasn't seen, or holds without the text it now needs, are read. When index_text
-        is False, the symbols are indexed and the text is left out. Call this inside a write transaction.
+        Only the contents the index hasn't seen are read. Call this inside a write transaction.
         """
-        unread: list[str] = []
-        for path, oid in files:
-            if not _has_indexed_text(path):
-                continue
-            known = session.blob_row(oid, _parsed_as(path))
-            if known is None or (index_text and session.lacks_text(known)):
-                unread.append(oid)
+        unread = [
+            oid for path, oid in files if _has_indexed_text(path) and session.blob_row(oid, parsed_as(path)) is None
+        ]
 
         sizes = git.blob_sizes(self.root, unread)
         small = [oid for oid in dict.fromkeys(unread) if sizes.get(oid, settings.MAX_BYTES + 1) <= settings.MAX_BYTES]
 
-        texts = {oid: _as_text(content) for oid, content in git.read_blobs(self.root, small) if content is not None}
+        texts = {oid: as_text(content) for oid, content in git.read_blobs(self.root, small) if content is not None}
         contents = [(path, oid, texts.get(oid) if _has_indexed_text(path) else None) for path, oid in files]
         parsed = _parse_new(session, contents)
 
-        return [
-            _add_blob(session, oid, path=path, text=text, parsed=parsed, index_text=index_text)
-            for path, oid, text in contents
-        ]
+        return [_add_blob(session, oid, path=path, text=text, parsed=parsed) for path, oid, text in contents]
 
     def _is_locked(self, name: LockName) -> bool:
         """True when another process holds one of the locks that _lock takes."""
@@ -378,7 +523,7 @@ def _parse_new(
     """
     new: dict[tuple[str, str], tuple[str, str]] = {}
     for path, oid, text in contents:
-        key = (oid, _parsed_as(path))
+        key = (oid, parsed_as(path))
         if text is not None and key not in new and session.blob_row(*key) is None:
             new[key] = (path, text)
 
@@ -392,24 +537,21 @@ def _add_blob(
     path: str,
     text: str | None,
     parsed: dict[tuple[str, str], list[Symbol]],
-    index_text: bool = True,
 ) -> int:
     """
     Return the row id of a file content, indexing it when the index hasn't  seen it. parsed holds the symbols
-    _parse_new found. A content stored without its text gets the text when index_text asks for it.
+    _parse_new found.
     """
-    parsed_as = _parsed_as(path)
-    known = session.blob_row(oid, parsed_as)
+    key = (oid, parsed_as(path))
+    known = session.blob_row(*key)
     if known is not None:
-        if index_text and text is not None and session.lacks_text(known):
-            session.add_text(known, text)
         return known
 
-    symbols = parsed.get((oid, parsed_as), []) if text is not None else []
-    return session.insert_blob(oid, parsed_as, text=text, symbols=symbols, index_text=index_text)
+    symbols = parsed.get(key, []) if text is not None else []
+    return session.insert_blob(*key, text=text, symbols=symbols)
 
 
-def _parsed_as(path: str) -> str:
+def parsed_as(path: str) -> str:
     """
     What decides how a file's content is indexed: its extension, or "" when its
     text is skipped. Two paths share a blobs row only when this is the same for both.
@@ -425,7 +567,7 @@ def _has_indexed_text(path: str) -> bool:
     return not any(fnmatch.fnmatch(name, pattern) for pattern in settings.SKIPPED_NAMES)
 
 
-def _as_text(content: bytes) -> str | None:
+def as_text(content: bytes) -> str | None:
     """The content decoded, or None for a file that is too big or binary (it has a NUL byte)."""
     if len(content) > settings.MAX_BYTES or b"\0" in content:
         return None

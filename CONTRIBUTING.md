@@ -13,17 +13,17 @@ uv sync
 A change must pass all of these before it merges:
 
 ```sh
-uv run pytest
+uv run pytest --cov
 uv run ruff check .
 uv run ruff format --check .
 uv run pyright
 ```
 
-Add a test for each behaviour change. The tests use temporary git repositories and directories. The first run may download tree-sitter grammars for the languages it parses; later runs work offline.
+Add a test for each behaviour change. `--cov` reports the lines no test ran, and fails when the tests run less than 90% of the code. The tests use temporary git repositories and directories. The first run may download tree-sitter grammars for the languages it parses; later runs work offline.
 
 ## Pull requests
 
-Keep each pull request to one coherent change. Describe what the change does and why, and include the commands you ran to check it. If the change alters the index format, raise `SCHEMA_VERSION` in `src/what/models.py` so old indexes rebuild.
+Keep each pull request to one coherent change. Describe what the change does and why, and include the commands you ran to check it. If the change alters the index format, raise `SCHEMA_VERSION` in `src/what/database.py` so old indexes rebuild.
 
 ## Releasing
 

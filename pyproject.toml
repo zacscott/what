@@ -1,6 +1,6 @@
 [project]
 name = "what"
-version = "0.2.0"
+version = "0.3.0"
 description = "Searches a git repository by symbol and text from the command line, deleted files included"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -44,6 +44,7 @@ build-backend = "uv_build"
 dev = [
     "pyright>=1.1.414",
     "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
     "ruff>=0.17.6",
 ]
 
@@ -56,3 +57,17 @@ typeCheckingMode = "strict"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["what"]
+branch = true
+# The tests start the command in processes of their own, and the index parses files in a pool of processes.
+patch = ["subprocess"]
+concurrency = ["multiprocessing"]
+parallel = true
+
+[tool.coverage.report]
+# The tests fail when they run less of the code than this. They ran 94% when this was set.
+fail_under = 90
+show_missing = true
+skip_covered = true

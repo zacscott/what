@@ -8,13 +8,23 @@ MAX_LINE_LENGTH = 180
 # How many matching lines one file shows in a text search before the rest are counted.
 LINES_PER_FILE = 8
 
+# How many files `find` lists after the symbols, when only their path matched.
+PATHS_SHOWN = 10
+
+# How many characters before a match are shown when the match is far along a line longer than MAX_LINE_LENGTH.
+MATCH_LEAD = 40
+
 # How many lines of a symbol or file `show` prints before it stops.
 SHOW_MAX_LINES = 400
 
+# How many files or branches the index must have to read before the command line shows its progress. A smaller
+# read is over before anyone could read the line.
+PROGRESS_FROM = 50
+
 # Limits on slow work.
 
-# How many candidate files a text search reads, after it shows its limit and only counts the hits it leaves out.
-# A pattern with no plain text makes every file a candidate.
+# How many candidate files a text search reads in all, once it has shown its limit and is only counting the hits it
+# leaves out. A pattern with no plain text makes every file a candidate.
 COUNT_FILES = 2000
 
 # Branches whose last commit is older than this many days are left out. They are rarely the answer, and a large
@@ -35,6 +45,10 @@ BRANCHES_READ_INLINE = 20
 # How many deleted files, or files on other branches, a text search reads from git. Each one costs a blob read.
 GIT_FILES_READ = 100
 
+# How many files `git grep` is given by name. Past this, it searches the whole commit, since a command line has
+# a length limit.
+GREP_PATHS = 500
+
 # How long `git log -S` may run. It reads every commit, which took 10 seconds on a 33,000 commit repository.
 COMMIT_SEARCH_SECONDS = 30
 
@@ -42,8 +56,15 @@ COMMIT_SEARCH_SECONDS = 30
 # a project.
 MAX_FILES = 50_000
 
+# How long a search waits before it starts the background build again, counted from when a build started and
+# again from when it failed. Without the wait, every search would start a build that fails the same way.
+BUILD_RETRY_SECONDS = 300
+
+# How big the log file gets before it is moved aside for a new one. One older file is kept.
+LOG_MAX_BYTES = 5_000_000
+
 # What goes into the index. The index keeps what it stored under the old values, so raising SCHEMA_VERSION in
-# models.py is needed after changing one.
+# database.py is needed after changing one.
 
 # Files bigger than this are generated or data, and would bloat the index.
 MAX_BYTES = 1_000_000
