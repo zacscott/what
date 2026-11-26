@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-11-27
 
 ### Fixed
 
@@ -32,8 +32,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - After a checkout of another branch, the background index of deleted files read every deleted file from git again when a search ran during the build. On a 33,000 commit repository that took about 50 seconds after each checkout, and now takes about 4.
 
-- A symbol the grammar pack gives no named kind for, such as a C `#define` or `typedef`, was stored with a kind like `{"other":"constant"}`, so `--kind constant` missed it. It is now stored as its kind.
-
 ### Added
 
 - `what status` shows what the index of the repository holds, whether its deleted files are up to date, whether a background build is running, and where the index and the log are.
@@ -52,15 +50,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - A log file at `~/.local/state/what/what.log`, or under `$XDG_STATE_HOME`. It has a line for each command, with its duration and how it ended, and a line each time the index reads files again. A failed command is logged with its traceback. A grammar that can't be downloaded is logged too, since its files get no symbols.
 
-- `find` and `show` look in the installed dependencies when the repository has no match, and `--deps` searches them every time. Each hit is labelled with its package and version, such as `vendor: robmorgan/phinx@0.16.1`. `grep` searches the dependencies' text only with `--deps`. The installed versions come from `composer.lock`, `package-lock.json`, `uv.lock` and `poetry.lock`. Only direct dependencies are searched unless `--all-deps` is given. Their symbols are indexed once for each package version, in an index every repository shares. A lockfile with packages that aren't installed gets a one-line note.
-
-- `what callers <symbol>` lists the lines that call or reference a symbol, each under the function it sits in. It leaves out the definitions and mentions in comments and docblocks. A call that may be to another symbol, such as a method called on an untyped variable, ends with `[possible]`.
-
 - `find` and `grep` search other branches when the working tree has no match, and `--branches` searches them every time. They search the default branch and every local and remote-tracking branch that isn't merged into it and has a commit in the last year. A hit is shown only where the branch's version of the file differs from the working tree, and is labelled with the branch and the age of its last commit. When remote-tracking branches were searched, the output says when they were last fetched.
-
-- `--ref <ref>` on `find`, `show` and `outline` answers at a branch, tag or commit in place of the working tree. It reads the files from git and needs no index of the ref. An unknown ref exits with an error that names it.
-
-- A qualified name with a namespace, such as `Phinx\Db\Table.addIndex`, matches the class without its namespace.
 
 ### Changed
 
@@ -76,12 +66,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - `show` prints each line as `line:text`, and `outline` prints each symbol as `first-last:signature`, both under the file's path. The other definitions that `show` lists are `path:line:signature`.
 
-- `--kind` accepts only the kinds the index holds, so a misspelt kind is an error and not an empty result.
 - The text index holds which files have each trigram and not where in the file. On a repository of 12,000 files and 840 branches the index went from 514MB to 160MB. `grep` now lists files in path order. Each index, and the index of dependencies, is built again on the first search after the upgrade.
 - `callers` stops reading files once it has shown its limit, and its first line says how many files it did not read. On the same repository a search went from 4 seconds to 0.2.
 - `grep` on other branches reads from git only the files that may match, because the text of branch files is now indexed. A `grep` with no match went from 1.3 seconds to 0.3.
 - `find` and `show` with `--ref` take symbols from the index for every file at the ref whose content it holds, and parse only the rest. `find` at the remote's default branch went from 1.8 seconds to 0.4.
 - A search no longer reads git's list of tracked files when git's index file has not changed since the last search. A name search went from about 170ms to about 120ms.
+
+## [0.2.0] - 2026-11-25
+
+### Fixed
+
+- A symbol the grammar pack gives no named kind for, such as a C `#define` or `typedef`, was stored with a kind like `{"other":"constant"}`, so `--kind constant` missed it. It is now stored as its kind.
+
+### Added
+
+- `find` and `show` look in the installed dependencies when the repository has no match, and `--deps` searches them every time. Each hit is labelled with its package and version, such as `vendor: robmorgan/phinx@0.16.1`. `grep` searches the dependencies' text only with `--deps`. The installed versions come from `composer.lock`, `package-lock.json`, `uv.lock` and `poetry.lock`. Only direct dependencies are searched unless `--all-deps` is given. Their symbols are indexed once for each package version, in an index every repository shares. A lockfile with packages that aren't installed gets a one-line note.
+
+- `what callers <symbol>` lists the lines that call or reference a symbol, each under the function it sits in. It leaves out the definitions and mentions in comments and docblocks. A call that may be to another symbol, such as a method called on an untyped variable, ends with `[possible]`.
+
+- `find` and `grep` search other branches when the working tree has no match, and `--branches` searches them every time. They search the default branch and every local and remote-tracking branch that isn't merged into it and has a commit in the last year. Branch files have their symbols indexed but not their text. A hit is shown only where the branch's version of the file differs from the working tree, and is labelled with the branch and the age of its last commit. When remote-tracking branches were searched, the output says when they were last fetched.
+
+- `--ref <ref>` on `find`, `show` and `outline` answers at a branch, tag or commit in place of the working tree. It reads the files from git and needs no index of the ref. An unknown ref exits with an error that names it.
+
+- A qualified name with a namespace, such as `Phinx\Db\Table.addIndex`, matches the class without its namespace.
+
+### Changed
+
+- `--kind` accepts only the kinds the index holds, so a misspelt kind is an error and not an empty result.
 - A big batch of files is parsed on every core, so the first index of a large repository is several times faster.
 - `grep` no longer prints a traceback when its reader, such as `head`, stops reading.
 - `grep` starts with the number of hits and files, such as `12 hits in 5 files, 4 shown`, so output cut by `head` or `--limit` says how much is missing.
